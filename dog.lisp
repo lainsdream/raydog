@@ -258,17 +258,16 @@
   (format t "~&Watching stopping (will exit after current sleep)~%"))
 
 (defun watch? ()
-  (multiple-value-bind (if-status ip) (if-status)
+  (multiple-value-bind (status ip) (if-status)
     (format t "~&Regime: ~a~%Running: ~a~%Watching: ~a:~a~%Interface: ~a (status ~a, ip ~a)~%"
             *regime*
             (and *thread* (sb-thread:thread-alive-p *thread*))
             *proxy-server-ip* *proxy-server-port*
-            *watched-interface* if-status ip)))
+            *watched-interface* status ip)))
 
 
 (defun connect ()
-  "(load \"dog.lisp\") (connect) — the whole thing: sing-box, tun2socks,
-   routes, and the watcher thread. Nothing else to load or call by hand."
+  "(load \"dog.lisp\") (connect) — nothing else to load or call by hand."
   (if *config-pool*
       (switch-to-config 0)
       (start-full))
@@ -283,3 +282,4 @@
   (when (and *thread* (sb-thread:thread-alive-p *thread*))
     (sb-thread:join-thread *thread* :default nil))
   (stop-full))
+  
