@@ -77,15 +77,12 @@ your_username ALL=(root) NOPASSWD: /usr/local/libexec/lisp-vpn-priv
 
 Remove any older sudoers entries for `setsid`/`route`/`ifconfig`/`kill`.
 
-`setup-routes proxy-IPv4` / `teardown-routes proxy-IPv4` capture and restore
-the default gateway atomically (state kept in `/var/run/lisp-vpn-original-gw`,
-written `O_EXCL` — a second `setup-routes` without a prior `teardown-routes`
-refuses rather than risk overwriting it). `start-tun utunN` / `stop-tun` run
-tun2socks, PID tracked in `/var/run/lisp-vpn-tun2socks.pid`. The helper only
-accepts `utun<digits>`, IPv4 args validated via `inet_pton`, the fixed local
-SOCKS endpoint, and the one root-owned tun2socks binary — it can't execute
-arbitrary programs as root. After a crash/reboot either state file can go
-stale; check `route -n get default` before removing one by hand.
+Each subcommand does exactly one thing — `setup-routes`/`teardown-routes
+proxy-IPv4` capture/restore the default gateway, `start-tun`/`stop-tun
+utunN` run tun2socks, `assign-tun utunN` brings the TUN up. All rollback
+logic, input validation, and PID-reuse safety live as short comments
+directly above the relevant code in `lisp-vpn-priv.c` (~180 lines) — read it
+there rather than here; it won't drift out of sync with itself.
 
 ## Config
 
@@ -167,7 +164,7 @@ Or just toggle Wi-Fi to let DHCP reassign the route.
   `TUN_IP`, not a Lisp variable — change it there and rebuild the helper.
 - tun2socks's PID lives in `/var/run/lisp-vpn-tun2socks.pid`; after a crash
   or reboot it can block the next `start-tun` until removed.
-- tun2socks logs to `/var/log/lisp-vpn-tun2socks.log`, not Lisp's stdout —
-  it outlives the helper process that launched it.
+- tun2socks logs to `/var/log/lisp-vpn-tun2socks.log`, not Lisp's stdout (see
+  the comment above `start-tun` in `lisp-vpn-priv.c` for why).
 - Always pass `:input nil` to sudo'd background processes in
   `run-program`, or they can hang waiting on a tty.
