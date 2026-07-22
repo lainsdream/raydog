@@ -1,8 +1,4 @@
 
-  ;;; ---------------------------------------------------------------------
-  ;;; Small string / base64 helpers (no external deps)
-  ;;; ---------------------------------------------------------------------
-
 (defparameter *b64-table*
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
@@ -86,10 +82,6 @@
 (defun qval (alist key &optional default)
   (or (cdr (assoc key alist :test #'string=)) default))
 
-  ;;; ---------------------------------------------------------------------
-  ;;; JSON writer (tiny, just enough for xray config)
-  ;;; ---------------------------------------------------------------------
-
 (defun json-escape-string (s)
   "Return S with JSON-special chars escaped (no surrounding quotes)."
   (with-output-to-string (out)
@@ -136,19 +128,15 @@
 (defun json-to-string (obj)
   (with-output-to-string (s) (json-write obj s)))
 
-  ;;; ---------------------------------------------------------------------
-  ;;; Config URI parsing
-  ;;; ---------------------------------------------------------------------
-
 (defstruct proxy-config
-  kind        ; :vless | :shadowsocks
-  tag         ; display name (fragment or host)
-  uuid        ; vless only
-  method      ; ss only
-  password    ; ss only
+  kind
+  tag
+  uuid
+  method
+  password
   host port
-  raw         ; original URI
-  extra)      ; query-string alist
+  raw
+  extra)
 
 (defun strip-fragment (uri)
   "Return (values uri-without-fragment fragment-or-nil)."
@@ -180,7 +168,7 @@
     (let ((body (subseq body (length "ss://"))))
       (multiple-value-bind (userinfo hostport) (split-once body #\@)
         (if hostport
-            ;; modern:  ss://[base64(method:pass) | method:pass]@host:port[?query]
+            ;; Modern Shadowsocks URI form.
             (let* ((decoded (if (position #\: userinfo)
                                 userinfo
                                 (b64-decode userinfo))))
@@ -198,7 +186,7 @@
                                    (error "ss: bad port in ~a" uri))
                      :raw      uri
                      :extra    nil)))))
-            ;; legacy: ss://BASE64(method:password@host:port)
+            ;; Legacy base64-encoded URI form.
             (let ((decoded (b64-decode body)))
               (multiple-value-bind (userinfo hp) (split-once decoded #\@)
                 (multiple-value-bind (method password) (split-once userinfo #\:)

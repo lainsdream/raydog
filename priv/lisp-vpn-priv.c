@@ -1,16 +1,4 @@
-/*
- * lisp-vpn-priv.c — deliberately narrow root helper for lisp-vpn on macOS.
- *
- * Install root:wheel, mode 0755. Grant sudo only for this binary, NOT for
- * setsid, route, ifconfig, or kill. No shell is ever invoked.
- *
- * Route setup/teardown is owned entirely by this helper (setup-routes /
- * teardown-routes): it captures the pre-tunnel default gateway itself,
- * persists it in a root-owned state file, and is the only thing that ever
- * reads that file back to restore it. The caller (Lisp) never sees or
- * passes a gateway address — it can't get it stale, and it can't corrupt
- * it, because it never holds it in the first place.
- */
+/* Privileged boundary: invoke only fixed binaries; gateway state never crosses it. */
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -45,9 +33,7 @@ static bool tun_name(const char *s) {
 }
 static void exec_or_die(char *const argv[]) { execv(argv[0], argv); perror(argv[0]); _exit(127); }
 
-/* Soft variant: run a fixed command, report success/failure, never exit
-   the whole helper. Used anywhere a caller needs to try a step, keep
-   going regardless, and clean up state at the end either way. */
+
 static bool run_wait_soft(char *const argv[]) {
   pid_t p = fork(); if (p < 0) return false;
   if (p == 0) exec_or_die(argv);
@@ -55,8 +41,7 @@ static bool run_wait_soft(char *const argv[]) {
   if (waitpid(p, &status, 0) < 0) return false;
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
-/* Hard variant: same, but a failure is fatal for the whole invocation.
-   Used for one-shot commands with nothing to unwind on failure. */
+
 static void run_wait(char *const argv[]) {
   if (!run_wait_soft(argv)) die("system command failed");
 }
@@ -80,12 +65,7 @@ static bool is_our_tun2socks(pid_t pid) {
   return n > 0 && strcmp(path, TUN2SOCKS) == 0;
 }
 
-/* --- gateway capture/state: the atomic-transaction piece --- */
-
-/* Runs `route -n get default` ourselves and parses its "gateway:" line.
-   No shell, no reliance on the caller's idea of what the gateway is —
-   we read it straight from the kernel's routing table at the moment
-   setup-routes runs, which is exactly the state we need to remember. */
+/* Capture the kernel route at setup time; never trust caller-supplied gateways. */
 static bool capture_default_gateway(char *out, size_t outlen) {
   int pipefd[2];
   if (pipe(pipefd) < 0) return false;
@@ -121,10 +101,7 @@ static bool capture_default_gateway(char *out, size_t outlen) {
   return true;
 }
 
-/* O_EXCL is the whole safety property here: if a gateway is already
-   captured (a previous setup-routes never got torn down — crash, reboot,
-   whatever), this fails loudly instead of silently overwriting a value
-   that might be the *tunnel's* gateway rather than the real one. */
+/* O_EXCL prevents overwriting pre-tunnel state after an interrupted setup. */
 static void write_gateway(const char *gw) {
   int fd = open(GWFILE, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0600);
   if (fd < 0)
@@ -156,14 +133,7 @@ int main(int argc, char **argv) {
     pid_t p = fork(); if (p < 0) die("fork failed");
     if (p == 0) {
       if (setsid() < 0) _exit(127);
-      /* lisp-vpn-priv's own stdout/stderr are a pipe owned by the caller
-         (sudo -n lisp-vpn-priv ..., via sb-ext:run-program). That pipe
-         closes the moment lisp-vpn-priv exits below, but tun2socks keeps
-         running detached (setsid) long after. If tun2socks inherited that
-         pipe and later wrote a log line to it, the write would fail with
-         SIGPIPE and (for a Go binary) kill the whole process instantly —
-         silently taking the tunnel down. Redirect to a real file first, so
-         the fds it holds stay valid for as long as it runs. */
+      /* Detached tun2socks needs durable output fds; caller pipes close on helper exit. */
       int logfd = open(TUN2SOCKS_LOG, O_WRONLY | O_CREAT | O_APPEND, 0600);
       if (logfd >= 0) {
         dup2(logfd, STDOUT_FILENO);
@@ -185,10 +155,7 @@ int main(int argc, char **argv) {
         die("refusing to signal PID from stale or unexpected pid file");
       if (kill(p, SIGTERM) < 0) die("failed to stop tun2socks");
     } else if (p > 1 && errno == ESRCH) {
-      /* The pid file names a process that no longer exists. That doesn't
-         mean there's nothing to clean up: a *different* tun2socks may be
-         running under an unrecorded PID (e.g. after an interrupted
-         start-tun). Warn instead of silently reporting success. */
+      /* A stale pid file may coexist with an unrecorded tun2socks process. */
       fprintf(stderr, "lisp-vpn-priv: warning: stale pid file (no such process %ld); "
               "check for an orphaned tun2socks manually (ps aux | grep tun2socks)\n", (long)p);
     } else if (p > 1) {
@@ -206,7 +173,6 @@ int main(int argc, char **argv) {
     char gw[64];
     if (!capture_default_gateway(gw, sizeof(gw)))
       die("could not determine current default gateway; refusing to proceed");
-    /* Dies here (nothing touched yet) if a gateway is already captured. */
     write_gateway(gw);
 
     char *const addhost[] = { ROUTE, "-n", "add", "-host", argv[2], gw, NULL };
@@ -217,8 +183,7 @@ int main(int argc, char **argv) {
 
     char *const change[] = { ROUTE, "-n", "change", "default", TUN_IP, NULL };
     if (!run_wait_soft(change)) {
-      /* Best-effort unwind: drop the host route we just added, then
-         clear captured state so a retry starts clean. */
+      /* Roll back partial route setup before clearing state. */
       char *const delhost[] = { ROUTE, "-n", "delete", "-host", argv[2], NULL };
       run_wait_soft(delhost);
       unlink(GWFILE);
@@ -235,12 +200,10 @@ int main(int argc, char **argv) {
       char *const change[] = { ROUTE, "-n", "change", "default", gw, NULL };
       restored = run_wait_soft(change);
     }
-    /* Best-effort: the host route may already be gone (e.g. a previous
-       teardown-routes partially ran). Not fatal either way. */
+
     char *const delhost[] = { ROUTE, "-n", "delete", "-host", argv[2], NULL };
     run_wait_soft(delhost);
-    /* Unconditional: whatever happened above, don't leave stale state
-       behind that would block the next setup-routes. */
+    /* Always clear state so a later setup can capture the current gateway. */
     unlink(GWFILE);
     if (!have_gw)
       die("no captured original gateway found; default route was not touched (check `route -n get default` manually)");

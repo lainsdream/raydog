@@ -1,37 +1,4 @@
-;;; dog.lisp
-;;;
-;;; One watcher thread, two jobs, checked on every tick so they can never
-;;; race each other:
-;;;
-;;;   1. Proxy liveness — server unreachable N times in a row -> (stop-full),
-;;;      fall back to a direct connection so you're never stuck without
-;;;      internet. Reachable again M times in a row (while in fallback) ->
-;;;      (start-full) again, tunnel restored automatically.
-;;;
-;;;   2. Network changes — Wi-Fi toggled, machine slept/woke, or reconnected
-;;;      to a different network. Detected via polling *watched-interface*'s
-;;;      status/IP, plus a wall-clock gap check for the sleep case (some
-;;;      Macs keep reporting Wi-Fi as "active" straight through a lid-close,
-;;;      so the status/IP check alone won't catch every wake). If the
-;;;      tunnel is supposed to be up when this happens, the routes captured
-;;;      before the change are stale (the gateway itself is owned by
-;;;      lisp-vpn-priv, not tracked here — see tun-ctl.lisp), so we force a
-;;;      fresh (stop-full) + (start-full) rather than waiting for the
-;;;      liveness check to notice indirectly.
-;;;
-;;; These two used to be separate watchers in separate threads (dog.lisp +
-;;; netwatch.lisp) coordinated by a shared mutex. Merged into one thread
-;;; instead: a single sequential loop makes the "never run stop-full/
-;;; start-full concurrently" guarantee free, by construction, no lock
-;;; needed.
-;;;
-;;; This is the only file you load. It pulls in singbox-ctl.lisp and
-;;; tun-ctl.lisp itself, resolved relative to its own location
-;;; (*load-truename*), so it doesn't matter what the current directory is
-;;; when you load it:
-;;;
-;;;   (load "dog.lisp")
-;;;   (connect)
+;;; A single watcher serializes tunnel reconfiguration.
 
 (let ((here (or *load-truename* *load-pathname*
                 (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
@@ -40,22 +7,12 @@
   (load (merge-pathnames "tun-ctl.lisp" here))
   (load (merge-pathnames "singbox-outbound.lisp" here)))
 
-;;; --- config: proxy liveness ---
 
 (defparameter *proxy-server-port* 8080
   "Port of the currently active proxy server. Update this alongside
    *proxy-server-ip* whenever you switch configs.")
 
-;;; --- config: server pool ---
-;;;
-;;; Each entry is a complete, ready-to-use sing-box config file (following
-;;; the tag:\"proxy\"/detour:\"proxy\"/mixed-inbound-1080 contract from the
-;;; README) plus the ip/port needed to TCP-check it directly. Deliberately
-;;; NOT multiple outbounds in one file behind urltest: that would need
-;;; lisp-vpn-priv to exclude several IPs from the tunnel at once, which it
-;;; doesn't support today, and touching that is a bigger, riskier change
-;;; than swapping one file for another. Exactly one outbound is ever live
-;;; at a time, so *proxy-server-ip* stays a single value, unchanged.
+;;; Keep one live outbound: the privileged helper excludes only one proxy IP from the tunnel.
 (defparameter *server-list-path* "/tmp/servers.txt"
   "One vless:// or ss:// URI per line, # for comments/blank lines ignored.
    See singbox-outbound.lisp's read-uri-lines/load-server-pool.")
@@ -119,7 +76,6 @@
    positive either way just costs one extra reconfigure cycle, the next
    tick catches and corrects it.")
 
-;;; --- config: network-change detection ---
 
 (defparameter *watched-interface* "en0"
   "Physical interface to watch for status/IP changes — Wi-Fi on most Macs.
@@ -136,13 +92,11 @@
    against a half-up interface just reproduces the original 'no internet'
    failure mode.")
 
-;;; --- state ---
 
 (defparameter *thread* nil)
 (defparameter *running* nil)
-(defparameter *regime* :tunnel) ; :tunnel | :direct
+(defparameter *regime* :tunnel)
 
-;;; --- proxy liveness check ---
 
 (defun tcp-alive-p (host port &key (timeout 3))
   "TCP connect check via nc — true if something accepts a connection
@@ -177,7 +131,6 @@
     (start-full)
     (setf *pool-index* index)))
 
-;;; --- interface introspection (read-only, unprivileged) ---
 
 (defun if-status ()
   "Returns (values status ip) for *watched-interface*, e.g. (\"active\"
@@ -212,22 +165,16 @@
     ((not (equal cur-ip last-ip))
      (format nil "~a IP changed ~a -> ~a" *watched-interface* last-ip cur-ip))))
 
-;;; --- reconfigure ---
 
 (defun full-reconfigure (reason)
   (format t "~&[dog] network change (~a), waiting ~as to settle~%" reason *settle-delay*)
   (sleep *settle-delay*)
-  ;; If we reconnected to a different network, teardown-routes may fail to
-  ;; restore the old gateway (unreachable from here now) — lisp-vpn-priv
-  ;; still clears its captured-gateway state either way (see
-  ;; lisp-vpn-priv.c), so the start-full below can capture a fresh,
-  ;; correct gateway for whatever network we're actually on now.
+  ;; Clear helper state even if the old gateway is unreachable, so restart captures the new one.
   (ignore-errors (stop-full))
   (sleep 1)
   (ignore-errors (start-full))
   (format t "~&[dog] reconfigure done~%"))
 
-;;; --- main loop ---
 
 (defun cycle ()
   (let ((fail-count 0) (ok-count 0))
@@ -243,28 +190,13 @@
                                                        now cur-if-status cur-if-ip)))
                     (setf last-if-status cur-if-status last-if-ip cur-if-ip last-tick now)
                     (cond
-                      ;; Network changed AND we landed on "active": this is the
-                      ;; moment reconnect actually happened (coming back from
-                      ;; wifi-off, sleep/wake, or a different network). Going
-                      ;; the other way — active -> inactive — has nothing to
-                      ;; fix: there's no gateway to capture with the interface
-                      ;; down, so a reconfigure attempt would just fail (or
-                      ;; churn sing-box/tun2socks for nothing) and get redone
-                      ;; a moment later anyway when the interface comes back.
+                      ;; Reconfigure only after an active interface can supply a gateway.
                       ((and reason (string= cur-if-status "active") (eq *regime* :tunnel))
                        (full-reconfigure reason)
-                       ;; A network change isn't a pool-entry death — the same
-                       ;; server just got restarted on a fresh connection, so
-                       ;; don't let this count against how many sweep attempts
-                       ;; are left before giving up on the whole pool.
+                       ;; A network change does not count as a pool failure.
                        (setf fail-count 0 ok-count 0 *sweep-tries* 0))
-                      ;; Network changed but either we're in :direct fallback
-                      ;; (nothing of ours is up to restart — let the normal
-                      ;; revive-check below keep doing its job) or the
-                      ;; interface just went inactive (nothing to fix yet).
                       (reason
                        (format t "~&[dog] network change (~a) noted, not reconfiguring~%" reason))
-                      ;; No network change this tick: normal proxy-liveness regime.
                       (t
                        (ecase *regime*
                          (:tunnel
@@ -282,10 +214,7 @@
                                           *sweep-tries* (length *config-pool*))
                                   (setf fail-count 0)
                                   (if (>= *sweep-tries* (length *config-pool*))
-                                      ;; Every entry in the pool has now failed in a
-                                      ;; row without a single success in between —
-                                      ;; only now do we give up on the tunnel
-                                      ;; entirely, not after just the first death.
+                                      ;; Fall back only after every pool entry fails.
                                       (progn
                                         (format t "~&[dog] whole pool exhausted, falling back to direct~%")
                                         (ignore-errors (stop-full))
@@ -306,7 +235,6 @@
                                   (setf *regime* :tunnel)))
                               (setf ok-count 0))))))))))))))
 
-;;; --- control ---
 
 (defun watch ()
   (when (and *thread* (sb-thread:thread-alive-p *thread*))
@@ -314,14 +242,7 @@
     (return-from watch))
   (setf *regime* :tunnel)
   (setf *running* t)
-  ;; sb-thread:make-thread does NOT inherit *standard-output* from the
-  ;; calling thread — a new thread gets the Lisp image's original
-  ;; top-level stream, not whatever stream SLIME/Swank has bound
-  ;; *standard-output* to for this particular REPL connection. Capture
-  ;; both streams here (in the caller's thread, where the binding is
-  ;; still the one you're looking at) and rebind them explicitly inside
-  ;; the new thread, or cycle's (format t ...) calls silently go
-  ;; somewhere you can't see.
+  ;; Threads do not inherit REPL stream bindings.
   (let ((out *standard-output*)
         (err *error-output*))
     (setf *thread*
@@ -345,7 +266,6 @@
             *proxy-server-ip* *proxy-server-port*
             *watched-interface* if-status ip)))
 
-;;; --- the one entry point ---
 
 (defun connect ()
   "(load \"dog.lisp\") (connect) — the whole thing: sing-box, tun2socks,

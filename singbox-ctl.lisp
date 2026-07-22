@@ -19,15 +19,6 @@
    ahead with tun2socks/routes and only failing to make one clear.")
 (defparameter *process* nil)
 
-;; --- generic readiness polling, shared with tun-ctl.lisp ---
-;;
-;; Fixed (sleep N) before "the next step" is a race: N is a guess at how
-;; long the external process needs to become ready, and it's either wasted
-;; time (N too generous) or a silent failure later on (N too short, e.g. a
-;; slow machine). wait-until polls for the actual condition instead, and
-;; fails loudly with a clear message if it never becomes true, rather than
-;; letting a caller two steps downstream (assign-tun/setup-routes) fail
-;; with a confusing unrelated error.
 (defun wait-until (predicate &key (timeout 10) (interval 0.2) description)
   "Poll PREDICATE every INTERVAL seconds until it returns true, or signal
    an error naming DESCRIPTION once TIMEOUT seconds have passed."
@@ -61,23 +52,14 @@
                             :error :output
                             :if-output-exists :supersede
                             :wait nil))
-  ;; NB: we deliberately do NOT also check (sb-ext:process-alive-p *process*)
-  ;; here as a fail-fast signal. *process* is the *setsid* wrapper's PID —
-  ;; setsid forks and exits almost immediately (see README, "setsid форкает,
-  ;; а не exec'ает себя"), so process-alive-p on it is always NIL within
-  ;; moments of starting, even when sing-box itself is running fine. The
-  ;; SOCKS port is the only reliable signal we have.
+  ;; setsid exits after forking; only the SOCKS port confirms sing-box readiness.
   (wait-until (lambda () (port-open-p "127.0.0.1" *socks-port*))
               :timeout *start-timeout*
               :description (format nil "sing-box SOCKS port 127.0.0.1:~a (check ~a)"
                                     *socks-port* *log-path*))
   (format t "~&Started, pid ~a~%" (sb-ext:process-pid *process*)))
 
-;; sing-box is launched above via an unprivileged *setsid-bin* call — it runs
-;; as the current user, not root. Stopping it is therefore an ordinary
-;; same-user kill and never needs sudo. This fallback only exists for the
-;; case where the Lisp image was restarted and lost the *process* handle;
-;; even then it kills as ourselves, never as root.
+;; This fallback remains unprivileged even when the process handle is lost.
 (defun find-and-kill-by-name (name)
   (let ((output (with-output-to-string (s)
                   (ignore-errors
@@ -91,13 +73,9 @@
 
 (defun stop ()
   (if (and *process* (sb-ext:process-alive-p *process*))
-      ;; Preferred path: we hold the exact process object we started,
-      ;; so there's no PID-reuse ambiguity at all.
       (progn
         (sb-ext:process-kill *process* 9)
         (sb-ext:process-wait *process*))
-      ;; Fallback path: Lisp image was restarted (handle lost), or sing-box
-      ;; was started outside this session. Best effort, still unprivileged.
       (find-and-kill-by-name "sing-box run"))
   (setf *process* nil)
   (format t "~&Stopped~%"))

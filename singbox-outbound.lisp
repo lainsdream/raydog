@@ -1,24 +1,8 @@
-;;;; singbox-outbound.lisp
-;;;;
-;;;; Sing-box's outbound JSON schema, not xray's. Same proxy-config struct
-;;;; and parse-config-uri as test.lisp (loaded below if not
-;;;; already present) — only the JSON shape differs: sing-box puts
-;;;; server/server_port/uuid directly on the outbound object, and TLS/
-;;;; reality/transport are nested under tls/transport instead of xray's
-;;;; separate streamSettings block. See:
-;;;; https://sing-box.sagernet.org/configuration/outbound/vless/
-;;;; https://sing-box.sagernet.org/configuration/outbound/shadowsocks/
-;;;;
-;;;; This file only builds JSON strings — it doesn't touch *config-path*,
-;;;; *proxy-server-ip*, or run anything. dog.lisp wires the result into
-;;;; *config-pool* and switch-to-config does the actual swap.
-
 (let ((here (or *load-truename* *load-pathname*
                 (error "singbox-outbound.lisp must be loaded via (load ...)"))))
   (unless (fboundp 'parse-config-uri)
     (load (merge-pathnames "parse.lisp" here))))
 
-;;; --- sing-box outbound builders ---
 
 (defun singbox-tls-fields (cfg extra security)
   "Returns an alist of (\"tls\" . <obj>) or nil if there's no TLS at all."
@@ -78,9 +62,7 @@
                  (cons "server" (proxy-config-host cfg))
                  (cons "server_port" (proxy-config-port cfg))
                  (cons "uuid" (proxy-config-uuid cfg)))
-           ;; flow only makes sense with reality+tcp (xtls-rprx-vision);
-           ;; omit the key entirely rather than send an empty string —
-           ;; sing-box treats an empty flow differently from an absent one.
+           ;; Omit empty flow: sing-box distinguishes it from an absent field.
            (when (plusp (length flow)) (list (cons "flow" flow)))
            (singbox-tls-fields cfg extra security)
            (singbox-transport-fields extra network)))))
@@ -99,11 +81,7 @@
     (:vless       (vless-outbound-singbox cfg))
     (:shadowsocks (shadowsocks-outbound-singbox cfg))))
 
-;;; --- full config, following the README's fixed contract ---
-;;;
-;;; tag "proxy" / dns detour "proxy" / mixed inbound on 127.0.0.1:1080 —
-;;; must match *socks-port* in singbox-ctl.lisp. The only thing that
-;;; varies between pool entries is outbounds[0], built above.
+;;; Keep this inbound port synchronized with *socks-port*.
 
 (defun build-singbox-config (cfg)
   (list :obj
@@ -125,7 +103,6 @@
                           (cons "listen_port" 1080))))
         (cons "outbounds" (list :arr (proxy-outbound-singbox cfg)))))
 
-;;; --- .txt -> pool ---
 
 (defun read-uri-lines (txt-path)
   "One vless://or ss:// URI per line. Blank lines and lines starting with
