@@ -48,10 +48,15 @@ sudo mv tun2socks-darwin-arm64 /usr/local/bin/tun2socks
 Set `*singbox-bin*` / `*setsid-bin*` in `singbox-ctl.lisp` to match `which
 sing-box` / the util-linux path on your machine.
 
-## Building the root helper
+## Privileged helper
 
-`tun2socks` is copied to a root-owned path so a compromised user-level
-process can't swap the binary the helper executes as root:
+The helper replaces unsafe sudoers grants for `setsid`, `route`, `ifconfig`,
+and `kill`. It accepts only a fixed command vocabulary with validated
+arguments, runs fixed absolute-path binaries, and never invokes a shell.
+
+### Build and install (macOS)
+
+From the repository root:
 
 ```bash
 clang -Wall -Wextra -Werror -O2 lisp-vpn-priv.c -o lisp-vpn-priv
@@ -61,19 +66,41 @@ sudo install -o root -g wheel -m 0755 /usr/local/bin/tun2socks \
   /usr/local/libexec/lisp-vpn-tun2socks
 ```
 
-Re-run the last line whenever you update `tun2socks` — the root copy doesn't
-track the original automatically.
+The helper always executes the root-owned copy at
+`/usr/local/libexec/lisp-vpn-tun2socks`, never the Homebrew/user-writable
+one. Only the source path in the last command should change to match where
+`tun2socks` is installed. Re-run that command whenever you update it.
 
-## Passwordless sudo
+### Passwordless sudo
 
-```
+```sudoers
 your_username ALL=(root) NOPASSWD: /usr/local/libexec/lisp-vpn-priv
 ```
 
-Remove any older rules for `setsid`/`route`/`ifconfig`/`kill` — those are
-equivalent to unrestricted root. The helper itself validates all arguments
-and calls binaries directly, no shell, so allowlisting just this one path
-is safe.
+Remove any older rules for `setsid`, `route`, `ifconfig`, or `kill`.
+`NOPASSWD` on those bare commands is effectively unrestricted root access.
+Allowlisting the helper alone is safe because it validates all inputs and
+calls binaries directly.
+
+### Helper commands and limits
+
+- **`start-tun utunN` / `stop-tun`** — start/stop tun2socks; its PID is in
+  `/var/run/lisp-vpn-tun2socks.pid`.
+- **`assign-tun utunN`** — bring the TUN interface up with the fixed tunnel IP.
+- **`setup-routes proxy-IPv4`** — atomically captures the current default
+  gateway, adds a host route to the proxy through it, then points the default
+  route at the TUN. On failure it rolls back the change.
+- **`teardown-routes proxy-IPv4`** — restores the captured default gateway,
+  removes the proxy host route, and clears state.
+
+The helper can touch only the default route and one IPv4 host route. It
+accepts only `utun<digits>`, IPv4 addresses validated with `inet_pton`, the
+fixed local SOCKS endpoint, and the fixed root-owned tun2socks binary.
+
+After a crash or reboot, the PID file above and
+`/var/run/lisp-vpn-original-gw` may be stale. Check `route -n get default`
+before manually removing either file. A second `setup-routes` refuses to run
+while the gateway-state file exists, rather than risking an overwrite.
 
 ## Config
 
