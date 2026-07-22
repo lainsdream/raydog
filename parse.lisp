@@ -125,9 +125,6 @@
      (write-char #\] stream))
     (t (error "bad json obj: ~s" obj))))
 
-(defun json-to-string (obj)
-  (with-output-to-string (s) (json-write obj s)))
-
 (defstruct proxy-config
   kind
   tag
