@@ -5,7 +5,7 @@
                         *load-truename* is how it finds singbox-ctl.lisp and tun-ctl.lisp next to it"))))
   (load (merge-pathnames "singbox-ctl.lisp" here))
   (load (merge-pathnames "tun-ctl.lisp" here))
-  (load (merge-pathnames "singbox-outbound.lisp" here)))
+  (load (merge-pathnames "config.lisp" here)))
 
 
 (defparameter *proxy-server-port* 8080
@@ -15,7 +15,7 @@
 ;;; Keep one live outbound: the privileged helper excludes only one proxy IP from the tunnel.
 (defparameter *server-list-path* "/tmp/servers.txt"
   "One vless:// or ss:// URI per line, # for comments/blank lines ignored.
-   See singbox-outbound.lisp's read-uri-lines/load-server-pool.")
+   See config.lisp's read-uri-lines/load-server-pool.")
 
 (defparameter *pool-config-dir* "/tmp/pool-configs/"
   "Where load-server-pool writes one complete sing-box config file per

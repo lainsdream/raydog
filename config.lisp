@@ -1,5 +1,5 @@
 (let ((here (or *load-truename* *load-pathname*
-                (error "singbox-outbound.lisp must be loaded via (load ...)"))))
+                (error "config.lisp must be loaded via (load ...)"))))
   (unless (fboundp 'parse-config-uri)
     (load (merge-pathnames "parse.lisp" here))))
 
