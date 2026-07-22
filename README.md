@@ -16,15 +16,20 @@ as needed. For just the tunnel with no watcher, use `singbox.lisp` /
 - **`tun.lisp`** — creates the TUN interface, redirects traffic, rolls
   back routes on stop. All privileged work goes through one root helper
   (below), never called directly.
-- **`dog.lisp`** — the only file you load. Pulls in the two files above and
-  adds a watcher thread doing two jobs on every tick:
-  1. **Proxy liveness** — TCP-checks the server; N failures in a row →
-     fall back to direct (no VPN); M successes back → restore the tunnel.
-  2. **Network changes** — Wi-Fi toggle, sleep/wake, network switch. Forces
-     a full teardown+rebuild rather than waiting for liveness to catch it.
-- **`lisp-vpn-priv.c`** — the root helper. Fixed subcommand set
+- **`lisp-vpn-priv.c`** — source for that helper. Fixed subcommand set
   (`setup-routes`, `teardown-routes`, `assign-tun`, `start-tun`, `stop-tun`),
   runs `route`/`ifconfig`/`tun2socks` by absolute path, no shell involved.
+- **`config.lisp`** — parses `vless://`/`ss://` URIs and writes a matching
+  sing-box JSON config for each. No network or process code; pure parsing +
+  JSON generation.
+- **`dog.lisp`** — the only file you load. Pulls in the three files above
+  and adds a watcher thread doing two jobs on every tick:
+  1. **Proxy liveness** — TCP-checks the server; N failures in a row →
+     fall back to direct (no VPN). On repeated failure it also rotates to
+     the next entry in the config pool round-robin, rather than retrying
+     the same dead server forever. M successes back → tunnel restored.
+  2. **Network changes** — Wi-Fi toggle, sleep/wake, network switch. Forces
+     a full teardown+rebuild rather than waiting for liveness to catch it.
 
 ## How it works
 
@@ -50,60 +55,47 @@ sing-box` / the util-linux path on your machine.
 
 ## Privileged helper
 
-The helper replaces unsafe sudoers grants for `setsid`, `route`, `ifconfig`,
-and `kill`. It accepts only a fixed command vocabulary with validated
-arguments, runs fixed absolute-path binaries, and never invokes a shell.
-
-### Build and install (macOS)
-
-From the repository root:
+Creating the TUN and changing routes needs root. Rather than granting sudo
+on `setsid`/`route`/`ifconfig`/`kill` directly (equivalent to unrestricted
+root), everything privileged goes through `lisp-vpn-priv`: a fixed command
+vocabulary, validated arguments, fixed absolute-path binaries, no shell.
 
 ```bash
 clang -Wall -Wextra -Werror -O2 lisp-vpn-priv.c -o lisp-vpn-priv
 sudo install -d -o root -g wheel -m 0755 /usr/local/libexec
 sudo install -o root -g wheel -m 0755 lisp-vpn-priv /usr/local/libexec/lisp-vpn-priv
+# root-owned copy — the helper always execs *this* path, never your
+# Homebrew/user-writable tun2socks. Only the source path here should
+# change to match where tun2socks is installed; re-run after updating it.
 sudo install -o root -g wheel -m 0755 /usr/local/bin/tun2socks \
   /usr/local/libexec/lisp-vpn-tun2socks
 ```
-
-The helper always executes the root-owned copy at
-`/usr/local/libexec/lisp-vpn-tun2socks`, never the Homebrew/user-writable
-one. Only the source path in the last command should change to match where
-`tun2socks` is installed. Re-run that command whenever you update it.
-
-### Passwordless sudo
 
 ```sudoers
 your_username ALL=(root) NOPASSWD: /usr/local/libexec/lisp-vpn-priv
 ```
 
-`NOPASSWD` on those bare commands is effectively unrestricted root access.
-Allowlisting the helper alone is safe because it validates all inputs and
-calls binaries directly.
+Remove any older sudoers entries for `setsid`/`route`/`ifconfig`/`kill`.
 
-### Helper commands and limits
-
-- **`start-tun utunN` / `stop-tun`** — start/stop tun2socks; its PID is in
-  `/var/run/lisp-vpn-tun2socks.pid`.
-- **`assign-tun utunN`** — bring the TUN interface up with the fixed tunnel IP.
-- **`setup-routes proxy-IPv4`** — atomically captures the current default
-  gateway, adds a host route to the proxy through it, then points the default
-  route at the TUN. On failure it rolls back the change.
-- **`teardown-routes proxy-IPv4`** — restores the captured default gateway,
-  removes the proxy host route, and clears state.
-
-The helper can touch only the default route and one IPv4 host route. It
-accepts only `utun<digits>`, IPv4 addresses validated with `inet_pton`, the
-fixed local SOCKS endpoint, and the fixed root-owned tun2socks binary.
-
-After a crash or reboot, the PID file above and
-`/var/run/lisp-vpn-original-gw` may be stale. Check `route -n get default`
-before manually removing either file. A second `setup-routes` refuses to run
-while the gateway-state file exists, rather than risking an overwrite.
+`setup-routes proxy-IPv4` / `teardown-routes proxy-IPv4` capture and restore
+the default gateway atomically (state kept in `/var/run/lisp-vpn-original-gw`,
+written `O_EXCL` — a second `setup-routes` without a prior `teardown-routes`
+refuses rather than risk overwriting it). `start-tun utunN` / `stop-tun` run
+tun2socks, PID tracked in `/var/run/lisp-vpn-tun2socks.pid`. The helper only
+accepts `utun<digits>`, IPv4 args validated via `inet_pton`, the fixed local
+SOCKS endpoint, and the one root-owned tun2socks binary — it can't execute
+arbitrary programs as root. After a crash/reboot either state file can go
+stale; check `route -n get default` before removing one by hand.
 
 ## Config
 
-`*config-path*` in `singbox.lisp` points at a sing-box JSON config:
+`*config-path*` in `singbox.lisp` points at a sing-box JSON config. You
+don't write these by hand — `dog.lisp` reads one `vless://`/`ss://` URI per
+line from `*server-list-path*` (default `/tmp/servers.txt`, `#` for
+comments) and `config.lisp` generates a matching config per line. `(connect)`
+starts on entry 0; on failure the watcher rotates through the rest.
+
+Minimal example of what gets generated (Shadowsocks):
 
 ```json
 {
@@ -132,16 +124,8 @@ while the gateway-state file exists, rather than risking an overwrite.
 }
 ```
 
-**`dns` is required** — without it, DNS leaks outside the tunnel even
-though your traffic doesn't. `outbounds[0].tag`, `dns.servers[0].detour`,
-and `inbounds[0]` must stay exactly as shown; only `outbounds[0]` itself
-changes between configs.
-
-You don't build these by hand — `dog.lisp` reads one `vless://`/`ss://` URI
-per line from `*server-list-path*` (default `/tmp/servers.txt`) and
-generates a config per line via `load-server-pool`. `(connect)` starts on
-entry 0; `switch-to-config` keeps `*proxy-server-ip*`/`*proxy-server-port*`
-in sync automatically.
+`dns` matters — without it, DNS leaks outside the tunnel even though your
+traffic doesn't.
 
 ## Usage
 
@@ -180,7 +164,7 @@ Or just toggle Wi-Fi to let DHCP reassign the route.
   at the wrong process. Processes are found and killed by command-line name
   (`pgrep -f`), not by PID — this is the primary mechanism, not a fallback.
 - The TUN subnet (`198.18.0.1`) is hardcoded in `lisp-vpn-priv.c` as
-  `TUN_IP`, not a Lisp variable — change it there and rebuild.
+  `TUN_IP`, not a Lisp variable — change it there and rebuild the helper.
 - tun2socks's PID lives in `/var/run/lisp-vpn-tun2socks.pid`; after a crash
   or reboot it can block the next `start-tun` until removed.
 - tun2socks logs to `/var/log/lisp-vpn-tun2socks.log`, not Lisp's stdout —
