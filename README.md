@@ -77,7 +77,6 @@ one. Only the source path in the last command should change to match where
 your_username ALL=(root) NOPASSWD: /usr/local/libexec/lisp-vpn-priv
 ```
 
-Remove any older rules for `setsid`, `route`, `ifconfig`, or `kill`.
 `NOPASSWD` on those bare commands is effectively unrestricted root access.
 Allowlisting the helper alone is safe because it validates all inputs and
 calls binaries directly.
