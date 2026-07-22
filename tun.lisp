@@ -1,13 +1,12 @@
 (defparameter *priv-helper-bin* "/usr/local/libexec/lisp-vpn-priv")
 (defparameter *tun-name* "utun9")
 (defparameter *proxy-server-ip* nil
-  "IP текущего активного сервера — ВАЖНО исключить его из туннеля
-   host-route'ом. Само значение сюда не хардкодится: dog.lisp
-   перезаписывает его через (setf *proxy-server-ip* ...) в
-   switch-to-config при каждом переключении на новый пул-энтри, ещё до
-   первого start-full. Переменная объявлена здесь как special var,
-   потому что setup-routes/teardown-routes в этом файле — единственные
-   её потребители.")
+  "IP of the currently active server — important to exclude it from the
+   tunnel via a host route. Not hardcoded here: dog.lisp overwrites it via
+   (setf *proxy-server-ip* ...) in switch-to-config on every pool-entry
+   switch, before the first start-full. Declared here as a special var
+   because setup-routes/teardown-routes in this file are its only
+   consumers.")
 (defparameter *tun-start-timeout* 10
   "Seconds to wait for the TUN interface to actually appear after
    start-tun. lisp-vpn-priv's start-tun subcommand spawns tun2socks via
