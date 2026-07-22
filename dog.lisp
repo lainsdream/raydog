@@ -103,8 +103,19 @@
    ICMP ping: many hosts firewall ICMP while the actual proxy port is
    fine, and ping-ok says nothing about whether the proxy service itself
    is still alive. A longer one-shot timeout than wait-until's polling
-   default, since this runs once per tick rather than in a tight loop."
-  (port-open-p *proxy-server-ip* *proxy-server-port* :timeout 3))
+   default, since this runs once per tick rather than in a tight loop.
+
+   Wrapped in ignore-errors: tick-tunnel/tick-direct call this every
+   cycle tick with nothing else guarding it, unlike the reconfigure calls
+   around them which are all (ignore-errors ...). Without this, a broken
+   /usr/bin/nc (missing binary, bad PATH, etc) would signal out of cycle
+   and silently kill the watcher thread instead of just reading as
+   'server unreachable' like any other failed check."
+  (multiple-value-bind (alive condition)
+      (ignore-errors (port-open-p *proxy-server-ip* *proxy-server-port* :timeout 3))
+    (when condition
+      (format t "~&[dog] server-alive-p check errored (~a) — treating as unreachable~%" condition))
+    alive))
 
 (defun switch-to-config (index)
   "Point everything at *config-pool* entry INDEX and bring the tunnel up

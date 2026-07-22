@@ -50,6 +50,14 @@ sudo mv tun2socks-darwin-arm64 /usr/local/bin/tun2socks
 Set `*singbox-bin*` / `*setsid-bin*` in `singbox.lisp` to match `which
 sing-box` / the util-linux path on your machine.
 
+`nc` at the hardcoded path `/usr/bin/nc` is also required — both sing-box
+startup polling (`port-open-p` in `singbox.lisp`) and the watcher's proxy
+liveness check (`server-alive-p` in `dog.lisp`) shell out to it. Ships
+with macOS by default, nothing to install, but if it's ever missing or
+moved the watcher thread degrades to reading the proxy as unreachable
+rather than crashing — check for a `server-alive-p check errored` log
+line if liveness checks look wrong.
+
 No Quicklisp, no third-party Lisp libraries — base64, URL-decoding, and
 JSON generation in config.lisp are hand-rolled on purpose, to keep the
 whole thing self-contained (just SBCL + uiop, which ships with it).
