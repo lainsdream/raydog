@@ -50,6 +50,10 @@ sudo mv tun2socks-darwin-arm64 /usr/local/bin/tun2socks
 Set `*singbox-bin*` / `*setsid-bin*` in `singbox.lisp` to match `which
 sing-box` / the util-linux path on your machine.
 
+No Quicklisp, no third-party Lisp libraries — base64, URL-decoding, and
+JSON generation in config.lisp are hand-rolled on purpose, to keep the
+whole thing self-contained (just SBCL + uiop, which ships with it).
+
 ## Privileged helper
 
 Creating the TUN and changing routes needs root. Rather than granting sudo
