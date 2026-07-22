@@ -14,14 +14,14 @@
    setsid in the background and returns as soon as it's launched, not
    once the interface exists — so `privileged` returning is not itself a
    readiness signal, same reasoning as sing-box's SOCKS port in
-   singbox-ctl.lisp.")
+   singbox.lisp.")
 
 ;; The privileged helper alone captures and restores the original gateway.
 
 (defun tun-interface-up-p (name)
   "True once NAME shows up as a real interface via ifconfig — this is the
    actual readiness signal for start-tun, polled by wait-until (defined in
-   singbox-ctl.lisp, loaded before this file) instead of guessing with a
+   singbox.lisp, loaded before this file) instead of guessing with a
    fixed sleep."
   (zerop (sb-ext:process-exit-code
           (sb-ext:run-program "/sbin/ifconfig" (list name)

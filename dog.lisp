@@ -2,9 +2,9 @@
 
 (let ((here (or *load-truename* *load-pathname*
                 (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
-                        *load-truename* is how it finds singbox-ctl.lisp and tun-ctl.lisp next to it"))))
-  (load (merge-pathnames "singbox-ctl.lisp" here))
-  (load (merge-pathnames "tun-ctl.lisp" here))
+                        *load-truename* is how it finds singbox.lisp and tun.lisp next to it"))))
+  (load (merge-pathnames "singbox.lisp" here))
+  (load (merge-pathnames "tun.lisp" here))
   (load (merge-pathnames "config.lisp" here)))
 
 

@@ -6,14 +6,14 @@ any sing-box outbound (Shadowsocks, VLESS, etc). No GUI, no v2box.
 Controlled from the REPL, no system daemon. `(connect)` in `dog.lisp` starts
 the tunnel plus a background watcher thread that keeps it alive — checks
 proxy liveness and network changes on its own, calls `stop-full`/`start-full`
-as needed. For just the tunnel with no watcher, use `singbox-ctl.lisp` /
-`tun-ctl.lisp` directly (`start-full` / `stop-full`).
+as needed. For just the tunnel with no watcher, use `singbox.lisp` /
+`tun.lisp` directly (`start-full` / `stop-full`).
 
 ## Files
 
-- **`singbox-ctl.lisp`** — starts/stops sing-box (SOCKS5 inbound on
+- **`singbox.lisp`** — starts/stops sing-box (SOCKS5 inbound on
   `127.0.0.1:1080`). Runs unprivileged via `setsid`.
-- **`tun-ctl.lisp`** — creates the TUN interface, redirects traffic, rolls
+- **`tun.lisp`** — creates the TUN interface, redirects traffic, rolls
   back routes on stop. All privileged work goes through one root helper
   (below), never called directly.
 - **`dog.lisp`** — the only file you load. Pulls in the two files above and
@@ -45,7 +45,7 @@ brew install util-linux   # for setsid (keg-only)
 sudo mv tun2socks-darwin-arm64 /usr/local/bin/tun2socks
 ```
 
-Set `*singbox-bin*` / `*setsid-bin*` in `singbox-ctl.lisp` to match `which
+Set `*singbox-bin*` / `*setsid-bin*` in `singbox.lisp` to match `which
 sing-box` / the util-linux path on your machine.
 
 ## Privileged helper
@@ -103,7 +103,7 @@ while the gateway-state file exists, rather than risking an overwrite.
 
 ## Config
 
-`*config-path*` in `singbox-ctl.lisp` points at a sing-box JSON config:
+`*config-path*` in `singbox.lisp` points at a sing-box JSON config:
 
 ```json
 {
@@ -155,8 +155,8 @@ in sync automatically.
 Manual (no watcher/failover):
 
 ```lisp
-(load "singbox-ctl.lisp")
-(load "tun-ctl.lisp")
+(load "singbox.lisp")
+(load "tun.lisp")
 (start-full)
 (status)
 (stop-full)
