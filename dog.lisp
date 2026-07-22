@@ -1,14 +1,16 @@
 ;;; A single watcher serializes tunnel reconfiguration.
 
-(let ((here (or *load-truename* *load-pathname*
-                (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
-                        *load-truename* is how it finds singbox.lisp and tun.lisp next to it"))))
-  (load (merge-pathnames "singbox.lisp" here))
-  (load (merge-pathnames "tun.lisp" here))
-  (load (merge-pathnames "config.lisp" here)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let ((here (or *load-truename* *load-pathname*
+                  *compile-file-truename* *compile-file-pathname*
+                  (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
+                          *load-truename* is how it finds singbox.lisp and tun.lisp next to it"))))
+    (load (merge-pathnames "singbox.lisp" here))
+    (load (merge-pathnames "tun.lisp" here))
+    (load (merge-pathnames "config.lisp" here))))
 
 
-(defparameter *proxy-server-port* 8080
+(defparameter *proxy-server-port* nil
   "Port of the currently active proxy server. Kept in sync with
    *proxy-server-ip* automatically by switch-to-config; set manually only
    on the no-pool path.")
@@ -23,12 +25,9 @@
 
 (defun try-load-server-pool ()
   "Wraps load-server-pool so a missing/unreadable *server-list-path* never
-   aborts loading the rest of dog.lisp — everything below this point
-   (watch, connect, cycle...) must still get defined even on a fresh
-   checkout with no servers.txt yet. Degrades to an empty pool instead,
-   which the sweep logic in cycle already treats as \"nothing to try,
-   fall back to direct on first failure\" — the same behavior as before
-   the pool existed at all."
+   aborts loading the rest of dog.lisp. Degrades to an empty pool, which
+   the sweep logic in cycle already treats as \"nothing to try, fall back
+   to direct on first failure\"."
   (handler-case (load-server-pool *server-list-path* *pool-config-dir*)
     (error (e)
       (format t "~&[dog] couldn't load ~a (~a) — starting with an empty pool.~%~
@@ -64,17 +63,18 @@
   "Seconds between checks — both proxy liveness and network state are
    checked on the same tick. Kept fairly relaxed on purpose: false
    verdicts cost more (needless reconfigures) than a slightly slower
-   reaction to a real change, since recovery is automatic anyway.")
+   reaction to a real change, since recovery is automatic anyway.
+   *fail-threshold* and *revive-threshold* both give ~40s windows at this
+   interval; a false positive either way just costs one extra reconfigure
+   cycle, the next tick catches and corrects it.")
 
 (defparameter *fail-threshold* 8
   "Consecutive failed proxy checks before declaring the server dead and
-   falling back to direct. At *poll-interval*=5 this is ~40s.")
+   falling back to direct.")
 
 (defparameter *revive-threshold* 8
   "Consecutive successful proxy checks (while in fallback) before
-   restoring the tunnel. Same ~40s window as *fail-threshold* — a false
-   positive either way just costs one extra reconfigure cycle, the next
-   tick catches and corrects it.")
+   restoring the tunnel.")
 
 
 (defparameter *watched-interface* "en0"
@@ -98,20 +98,13 @@
 (defparameter *regime* :tunnel)
 
 
-(defun tcp-alive-p (host port &key (timeout 3))
-  "TCP connect check via nc — true if something accepts a connection
-   on host:port within timeout seconds. Deliberately not an ICMP
-   ping: many hosts firewall ICMP while the actual proxy port is
-   fine, and ping-ok says nothing about whether the proxy service
-   itself is still alive."
-  (let ((proc (sb-ext:run-program "/usr/bin/nc"
-                                  (list "-z" "-w" (princ-to-string timeout)
-                                        host (princ-to-string port))
-                                  :output nil :error nil :wait t)))
-    (zerop (sb-ext:process-exit-code proc))))
-
 (defun server-alive-p ()
-  (tcp-alive-p *proxy-server-ip* *proxy-server-port*))
+  "TCP connect check via port-open-p (singbox.lisp) — deliberately not an
+   ICMP ping: many hosts firewall ICMP while the actual proxy port is
+   fine, and ping-ok says nothing about whether the proxy service itself
+   is still alive. A longer one-shot timeout than wait-until's polling
+   default, since this runs once per tick rather than in a tight loop."
+  (port-open-p *proxy-server-ip* *proxy-server-port* :timeout 3))
 
 (defun switch-to-config (index)
   "Point everything at *config-pool* entry INDEX and bring the tunnel up
@@ -176,6 +169,45 @@
   (format t "~&[dog] reconfigure done~%"))
 
 
+(defun tick-tunnel (fail-count)
+  "One liveness check while *regime* is :tunnel. Returns the new
+   fail-count. On repeated failure, rotates to the next pool entry, or —
+   once every entry has failed in this sweep — falls back to :direct."
+  (if (server-alive-p)
+      (progn (setf *sweep-tries* 0) 0)
+      (let ((fail-count (1+ fail-count)))
+        (format t "~&[dog] server unreachable ~a/~a~%" fail-count *fail-threshold*)
+        (when (>= fail-count *fail-threshold*)
+          (incf *sweep-tries*)
+          (format t "~&[dog] pool entry ~a (~a) presumed dead (sweep ~a/~a)~%"
+                  *pool-index* (getf (nth *pool-index* *config-pool*) :label)
+                  *sweep-tries* (length *config-pool*))
+          (setf fail-count 0)
+          (if (>= *sweep-tries* (length *config-pool*))
+              ;; Fall back only after every pool entry fails.
+              (progn
+                (format t "~&[dog] whole pool exhausted, falling back to direct~%")
+                (ignore-errors (stop-full))
+                (setf *sweep-tries* 0 *regime* :direct))
+              (let ((next (mod (1+ *pool-index*) (length *config-pool*))))
+                (ignore-errors (switch-to-config next)))))
+        fail-count)))
+
+(defun tick-direct (ok-count)
+  "One liveness check while *regime* is :direct. Returns the new
+   ok-count. Once *revive-threshold* successes in a row, restores the
+   tunnel."
+  (if (server-alive-p)
+      (let ((ok-count (1+ ok-count)))
+        (format t "~&[dog] server responding again ~a/~a~%" ok-count *revive-threshold*)
+        (when (>= ok-count *revive-threshold*)
+          (format t "~&[dog] server revived, restoring tunnel~%")
+          (ignore-errors (start-full))
+          (setf *regime* :tunnel)
+          (setf ok-count 0))
+        ok-count)
+      0))
+
 (defun cycle ()
   (let ((fail-count 0) (ok-count 0))
     (multiple-value-bind (if-status0 if-ip0) (if-status)
@@ -199,41 +231,8 @@
                        (format t "~&[dog] network change (~a) noted, not reconfiguring~%" reason))
                       (t
                        (ecase *regime*
-                         (:tunnel
-                          (if (server-alive-p)
-                              (progn (setf fail-count 0) (setf *sweep-tries* 0))
-                              (progn
-                                (incf fail-count)
-                                (format t "~&[dog] server unreachable ~a/~a~%"
-                                        fail-count *fail-threshold*)
-                                (when (>= fail-count *fail-threshold*)
-                                  (incf *sweep-tries*)
-                                  (format t "~&[dog] pool entry ~a (~a) presumed dead (sweep ~a/~a)~%"
-                                          *pool-index*
-                                          (getf (nth *pool-index* *config-pool*) :label)
-                                          *sweep-tries* (length *config-pool*))
-                                  (setf fail-count 0)
-                                  (if (>= *sweep-tries* (length *config-pool*))
-                                      ;; Fall back only after every pool entry fails.
-                                      (progn
-                                        (format t "~&[dog] whole pool exhausted, falling back to direct~%")
-                                        (ignore-errors (stop-full))
-                                        (setf ok-count 0 *sweep-tries* 0)
-                                        (setf *regime* :direct))
-                                      (let ((next (mod (1+ *pool-index*) (length *config-pool*))))
-                                        (ignore-errors (switch-to-config next))))))))
-                         (:direct
-                          (if (server-alive-p)
-                              (progn
-                                (incf ok-count)
-                                (format t "~&[dog] server responding again ~a/~a~%"
-                                        ok-count *revive-threshold*)
-                                (when (>= ok-count *revive-threshold*)
-                                  (format t "~&[dog] server revived, restoring tunnel~%")
-                                  (ignore-errors (start-full))
-                                  (setf fail-count 0 ok-count 0)
-                                  (setf *regime* :tunnel)))
-                              (setf ok-count 0))))))))))))))
+                         (:tunnel (setf fail-count (tick-tunnel fail-count)))
+                         (:direct (setf ok-count (tick-direct ok-count))))))))))))))
 
 
 (defun watch ()

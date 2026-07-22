@@ -159,44 +159,40 @@
              :raw   uri
              :extra (parse-query query))))))))
 
+(defun finish-ss-config (name method password hp uri)
+  "Shared tail for both Shadowsocks URI forms once METHOD/PASSWORD/HP
+   (host:port) have been pulled out — only how they got there differs
+   between the modern and legacy forms."
+  (multiple-value-bind (host port-str) (split-last hp #\:)
+    (make-proxy-config
+     :kind     :shadowsocks
+     :tag      (or name host)
+     :method   method
+     :password password
+     :host     host
+     :port     (or (parse-integer port-str :junk-allowed t)
+                   (error "ss: bad port in ~a" uri))
+     :raw      uri
+     :extra    nil)))
+
 (defun parse-shadowsocks (uri)
   (multiple-value-bind (body name) (strip-fragment uri)
     (let ((body (subseq body (length "ss://"))))
       (multiple-value-bind (userinfo hostport) (split-once body #\@)
         (if hostport
             ;; Modern Shadowsocks URI form.
-            (let* ((decoded (if (position #\: userinfo)
-                                userinfo
-                                (b64-decode userinfo))))
+            (let ((decoded (if (position #\: userinfo)
+                               userinfo
+                               (b64-decode userinfo))))
               (multiple-value-bind (method password) (split-once decoded #\:)
                 (multiple-value-bind (hp _q) (split-once hostport #\?)
                   (declare (ignore _q))
-                  (multiple-value-bind (host port-str) (split-last hp #\:)
-                    (make-proxy-config
-                     :kind     :shadowsocks
-                     :tag      (or name host)
-                     :method   method
-                     :password password
-                     :host     host
-                     :port     (or (parse-integer port-str :junk-allowed t)
-                                   (error "ss: bad port in ~a" uri))
-                     :raw      uri
-                     :extra    nil)))))
+                  (finish-ss-config name method password hp uri))))
             ;; Legacy base64-encoded URI form.
             (let ((decoded (b64-decode body)))
               (multiple-value-bind (userinfo hp) (split-once decoded #\@)
                 (multiple-value-bind (method password) (split-once userinfo #\:)
-                  (multiple-value-bind (host port-str) (split-last hp #\:)
-                    (make-proxy-config
-                     :kind     :shadowsocks
-                     :tag      (or name host)
-                     :method   method
-                     :password password
-                     :host     host
-                     :port     (or (parse-integer port-str :junk-allowed t)
-                                   (error "ss(b64): bad port in ~a" uri))
-                     :raw      uri
-                     :extra    nil))))))))))
+                  (finish-ss-config name method password hp uri)))))))))
 
 (defun parse-config-uri (uri)
   (let ((uri (string-trim '(#\Space #\Newline #\Return #\Tab) uri)))

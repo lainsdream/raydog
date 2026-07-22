@@ -32,13 +32,15 @@
                timeout (or description "condition")))
       (sleep interval))))
 
-(defun port-open-p (host port)
-  "True if something accepts a TCP connection on host:port right now.
-   Short per-call timeout (1s) — this is meant to be polled repeatedly by
-   wait-until, not used as a one-shot check."
+(defun port-open-p (host port &key (timeout 1))
+  "True if something accepts a TCP connection on host:port within TIMEOUT
+   seconds. Default is a short 1s timeout, meant for wait-until's repeated
+   polling; dog.lisp's server-alive-p passes a longer timeout since it's a
+   one-shot liveness check instead."
   (zerop (sb-ext:process-exit-code
           (sb-ext:run-program "/usr/bin/nc"
-                              (list "-z" "-w" "1" host (princ-to-string port))
+                              (list "-z" "-w" (princ-to-string timeout)
+                                    host (princ-to-string port))
                               :output nil :error nil :wait t))))
 
 (defun start ()
