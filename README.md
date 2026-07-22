@@ -16,9 +16,6 @@ as needed. For just the tunnel with no watcher, use `singbox.lisp` /
 - **`tun.lisp`** — creates the TUN interface, redirects traffic, rolls
   back routes on stop. All privileged work goes through one root helper
   (below), never called directly.
-- **`lisp-vpn-priv.c`** — source for that helper. Fixed subcommand set
-  (`setup-routes`, `teardown-routes`, `assign-tun`, `start-tun`, `stop-tun`),
-  runs `route`/`ifconfig`/`tun2socks` by absolute path, no shell involved.
 - **`config.lisp`** — parses `vless://`/`ss://` URIs and writes a matching
   sing-box JSON config for each. No network or process code; pure parsing +
   JSON generation.
@@ -57,8 +54,10 @@ sing-box` / the util-linux path on your machine.
 
 Creating the TUN and changing routes needs root. Rather than granting sudo
 on `setsid`/`route`/`ifconfig`/`kill` directly (equivalent to unrestricted
-root), everything privileged goes through `lisp-vpn-priv`: a fixed command
-vocabulary, validated arguments, fixed absolute-path binaries, no shell.
+root), everything privileged goes through `lisp-vpn-priv.c`: a fixed
+command vocabulary (`setup-routes`, `teardown-routes`, `assign-tun`,
+`start-tun`, `stop-tun`), validated arguments, fixed absolute-path
+binaries, no shell.
 
 ```bash
 clang -Wall -Wextra -Werror -O2 lisp-vpn-priv.c -o lisp-vpn-priv
@@ -83,6 +82,10 @@ utunN` run tun2socks, `assign-tun utunN` brings the TUN up. All rollback
 logic, input validation, and PID-reuse safety live as short comments
 directly above the relevant code in `lisp-vpn-priv.c` (~180 lines) — read it
 there rather than here; it won't drift out of sync with itself.
+
+Note the helper only ever excludes a single proxy IP from the tunnel (one
+host route) — that's why the pool below is cycled through one entry at a
+time rather than run concurrently.
 
 ## Config
 

@@ -9,10 +9,10 @@
 
 
 (defparameter *proxy-server-port* 8080
-  "Port of the currently active proxy server. Update this alongside
-   *proxy-server-ip* whenever you switch configs.")
+  "Port of the currently active proxy server. Kept in sync with
+   *proxy-server-ip* automatically by switch-to-config; set manually only
+   on the no-pool path.")
 
-;;; Keep one live outbound: the privileged helper excludes only one proxy IP from the tunnel.
 (defparameter *server-list-path* "/tmp/servers.txt"
   "One vless:// or ss:// URI per line, # for comments/blank lines ignored.
    See config.lisp's read-uri-lines/load-server-pool.")
