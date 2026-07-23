@@ -124,42 +124,45 @@
    on it: stop whatever's running, swap *config-path*/*proxy-server-ip*/
    *proxy-server-port* to match, start-full again. Callers are
    responsible for fail-count/sweep bookkeeping around this."
-  (let* ((entry (nth index *config-pool*)))
+  (let ((entry (nth index *config-pool*)))
     (unless entry
       (error "No pool entry at index ~a (pool has ~a entries)"
              index (length *config-pool*)))
-    (format t "~&[dog] switching to pool entry ~a: ~a (~a:~a)~%"
-            index (getf entry :label) (getf entry :ip) (getf entry :port))
-    (ignore-errors (stop-full))
-    (setf *config-path* (getf entry :path))
-    (setf *proxy-server-ip* (getf entry :ip))
-    (setf *proxy-server-port* (getf entry :port))
-    (start-full)
-    (setf *pool-index* index)))
+    (destructuring-bind (&key label path ip port) entry
+      (format t "~&[dog] switching to pool entry ~a: ~a (~a:~a)~%" index label ip port)
+      (ignore-errors (stop-full))
+      (setf *config-path* path *proxy-server-ip* ip *proxy-server-port* port)
+      (start-full)
+      (setf *pool-index* index))))
 
+
+(defun run-program-lines (program args)
+  "Runs PROGRAM with ARGS, returns its stdout as a list of lines, or nil
+   if the run errors or produces nothing. Shared by IF-STATUS and
+   CURRENT-GATEWAY, both of which shell out and scrape a line of output."
+  (let ((output (ignore-errors
+                 (with-output-to-string (s)
+                   (sb-ext:run-program program args :output s :error nil :wait t)))))
+    (when output (uiop:split-string output :separator '(#\Newline)))))
+
+(defun field-at (line separator n)
+  "Trims LINE, splits it on SEPARATOR, and returns the Nth field, also
+   trimmed. Returns nil if LINE is nil (e.g. the line we were looking
+   for wasn't found)."
+  (when line
+    (string-trim '(#\Space #\Tab)
+                 (nth n (uiop:split-string (string-trim '(#\Space #\Tab) line)
+                                           :separator (list separator))))))
 
 (defun if-status ()
   "Returns (values status ip) for *watched-interface*, e.g. (\"active\"
    \"192.168.1.23\") or (\"inactive\" nil). Never errors — a missing or
    unreadable interface just reads as inactive/nil, which is itself a
    valid 'something about the network changed' signal."
-  (let ((output (ignore-errors
-                 (with-output-to-string (s)
-                   (sb-ext:run-program "/sbin/ifconfig" (list *watched-interface*)
-                                       :output s :error nil :wait t)))))
-    (unless output
-      (return-from if-status (values "inactive" nil)))
-    (let* ((lines (uiop:split-string output :separator '(#\Newline)))
-           (status-line (find-if (lambda (l) (search "status:" l)) lines))
-           (inet-line (find-if (lambda (l) (search "inet " l)) lines))
-           (status (if status-line
-                       (string-trim '(#\Space #\Tab)
-                                    (second (uiop:split-string status-line :separator '(#\:))))
-                       "unknown"))
-           (ip (when inet-line
-                 (second (uiop:split-string (string-trim '(#\Space #\Tab) inet-line)
-                                            :separator '(#\Space))))))
-      (values status ip))))
+  (let ((lines (run-program-lines "/sbin/ifconfig" (list *watched-interface*))))
+    (unless lines (return-from if-status (values "inactive" nil)))
+    (values (or (field-at (find-if (lambda (l) (search "status:" l)) lines) #\: 1) "unknown")
+            (field-at (find-if (lambda (l) (search "inet " l)) lines) #\Space 1))))
 
 (defun detect-network-change (last-status last-ip cur-status cur-ip)
   "Returns a reason string if ifconfig itself reports something changed
@@ -186,17 +189,9 @@
    actually changed something real, instead of trusting the gap alone.
    Never errors — a failure to read just reads as nil, same spirit as
    IF-STATUS reading a missing interface as inactive/nil."
-  (let ((output (ignore-errors
-                 (with-output-to-string (s)
-                   (sb-ext:run-program "/sbin/route" (list "-n" "get" "default")
-                                       :output s :error nil :wait t)))))
-    (unless output (return-from current-gateway nil))
-    (let* ((lines (uiop:split-string output :separator '(#\Newline)))
-           (gw-line (find-if (lambda (l) (search "gateway:" l)) lines)))
-      (when gw-line
-        (let ((gw (string-trim '(#\Space #\Tab)
-                               (second (uiop:split-string gw-line :separator '(#\:))))))
-          (when (plusp (length gw)) gw))))))
+  (let* ((lines (run-program-lines "/sbin/route" (list "-n" "get" "default")))
+         (gw (field-at (find-if (lambda (l) (search "gateway:" l)) lines) #\: 1)))
+    (when (and gw (plusp (length gw))) gw)))
 
 
 (defun full-reconfigure (reason)
