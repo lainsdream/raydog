@@ -1,6 +1,20 @@
 ;;; A single watcher serializes tunnel reconfiguration.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; Must run BEFORE singbox.lisp/tun.lisp load — those files defparameter
+  ;; *process*/*proxy-server-ip*/etc, which would silently drop the handle
+  ;; to a live tunnel out from under us. At this point in the reload,
+  ;; *thread*/disconn (if bound at all) are still the OLD ones from the
+  ;; previous load, seeing the still-live state — exactly what we need to
+  ;; tear it down cleanly instead of leaking it.
+  (when (and (boundp '*thread*) (symbol-value '*thread*)
+             (sb-thread:thread-alive-p (symbol-value '*thread*))
+             (fboundp 'disconn))
+    (format t "~&[dog] reloading while connected — running (disconn) on the old session first~%")
+    (handler-case (funcall (symbol-function 'disconn))
+      (error (e)
+        (format t "~&[dog] auto-disconn failed (~a) — check `ps aux | grep tun2socks`, ~
+                   `route -n get default`, and /var/run/lisp-vpn-* by hand before continuing~%" e))))
   (let ((here (or *load-truename* *load-pathname*
                   *compile-file-truename* *compile-file-pathname*
                   (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
@@ -118,6 +132,24 @@
     (when condition
       (format t "~&[dog] server-alive-p check errored (~a) — treating as unreachable~%" condition))
     alive))
+
+(defparameter *tunnel-check-host* "1.1.1.1"
+  "External host used to confirm traffic is actually flowing through the
+   tunnel (TUN -> tun2socks -> sing-box -> proxy -> internet), as opposed
+   to server-alive-p's raw check against *proxy-server-ip*, which is
+   excluded from the TUN by its own host route and so says nothing about
+   whether the tunnel plumbing itself still works.")
+(defparameter *tunnel-check-port* 443)
+
+(defun tunnel-functional-p ()
+  "True only if the TUN interface exists AND traffic sent through it
+   actually reaches the internet. Unlike server-alive-p (which checks the
+   proxy's own reachability over a route that bypasses the TUN), this is
+   the one check that can detect a dead/vanished utun interface or a
+   wedged tun2socks after sleep/wake, where the route table still points
+   at TUN_IP but nothing is actually forwarding through it."
+  (and (ignore-errors (tun-interface-up-p *tun-name*))
+       (ignore-errors (port-open-p *tunnel-check-host* *tunnel-check-port* :timeout 3))))
 
 (defun switch-to-config (index)
   "Point everything at *config-pool* entry INDEX and bring the tunnel up
@@ -287,13 +319,23 @@
                             (full-reconfigure "sleep/wake gap, gateway unreadable")
                             (setf last-gateway (current-gateway))
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0))
-                           ((equal cur-gateway last-gateway)
-                            (format t "~&[dog] gateway unchanged (~a) after gap, skipping reconfigure~%"
-                                    cur-gateway))
-                           (t
+                           ((not (equal cur-gateway last-gateway))
                             (full-reconfigure (format nil "gateway changed ~a -> ~a after sleep/wake gap"
                                                       last-gateway cur-gateway))
                             (setf last-gateway cur-gateway)
+                            (setf fail-count 0 ok-count 0 *sweep-tries* 0))
+                           ((tunnel-functional-p)
+                            (format t "~&[dog] gateway unchanged (~a) and tunnel functional, skipping reconfigure~%"
+                                    cur-gateway))
+                           (t
+                            ;; Gateway address unchanged (still TUN_IP) says nothing
+                            ;; about whether utun/tun2socks itself survived the gap —
+                            ;; only an end-to-end check through tunnel-functional-p can
+                            ;; catch that. Reconfigure since the plumbing is dead.
+                            (format t "~&[dog] gateway unchanged (~a) but tunnel not functional after gap, reconfiguring~%"
+                                    cur-gateway)
+                            (full-reconfigure "sleep/wake gap, tunnel not functional")
+                            (setf last-gateway (current-gateway))
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0)))))
                       (t
                        ;; Quiet tick: keep our notion of the current gateway fresh so
@@ -342,7 +384,7 @@
       (start-full))
   (watch))
 
-(defun disconnect ()
+(defun disconn ()
   "Inverse of connect. unwatch only flips a flag — the watcher thread
    might be mid-iteration and could still be running its own stop-full/
    start-full right now. Join it first, so this thread's stop-full below

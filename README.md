@@ -145,7 +145,7 @@ traffic doesn't.
 (load "dog.lisp")
 (connect)     ; sing-box → tun2socks → routes → watcher, all in one
 (watch?)      ; current mode, thread status, interface
-(disconnect)  ; stop watcher, wait for it, roll everything back
+(disconn)  ; stop watcher, wait for it, roll everything back
 ```
 
 Manual (no watcher/failover):
