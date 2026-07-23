@@ -82,8 +82,10 @@
    Check `networksetup -listallhardwareports` if en0 isn't right on yours.")
 
 (defparameter *sleep-gap-threshold* 20
-  "If more wall-clock time passes between two ticks than this, conclude
-   the machine was asleep, regardless of what ifconfig reports right now.
+  "If more wall-clock time passes between two ticks than this, suspect the
+   machine was asleep. This alone no longer triggers a reconfigure — see
+   CYCLE, which confirms the suspicion by comparing the actual default
+   gateway before and after, and only reconfigures if it really changed.
    Must be comfortably larger than *poll-interval*.")
 
 (defparameter *settle-delay* 5
@@ -159,15 +161,42 @@
                                             :separator '(#\Space))))))
       (values status ip))))
 
-(defun detect-network-change (last-status last-ip last-tick now cur-status cur-ip)
-  "Returns a reason string if something changed since the last tick, else nil."
+(defun detect-network-change (last-status last-ip cur-status cur-ip)
+  "Returns a reason string if ifconfig itself reports something changed
+   since the last tick (interface status flip or IP change), else nil.
+   This is direct evidence, trusted immediately. A suspected sleep/wake
+   gap is a separate, weaker signal — see SLEEP-GAP-P and its handling in
+   CYCLE, which requires confirmation against the real gateway before
+   acting on it."
   (cond
-    ((> (- now last-tick) *sleep-gap-threshold*)
-     (format nil "~as gap since last check, likely sleep/wake" (- now last-tick)))
     ((not (string= cur-status last-status))
      (format nil "~a status ~a -> ~a" *watched-interface* last-status cur-status))
     ((not (equal cur-ip last-ip))
      (format nil "~a IP changed ~a -> ~a" *watched-interface* last-ip cur-ip))))
+
+(defun sleep-gap-p (last-tick now)
+  "True if more wall-clock time passed between ticks than
+   *sleep-gap-threshold* — grounds to suspect (not conclude) sleep/wake."
+  (> (- now last-tick) *sleep-gap-threshold*))
+
+(defun current-gateway ()
+  "Returns the current default gateway IPv4 as a string, or nil if it
+   can't be determined (no default route, /sbin/route missing/erred, or
+   unparseable output). Used to confirm a suspected sleep/wake gap
+   actually changed something real, instead of trusting the gap alone.
+   Never errors — a failure to read just reads as nil, same spirit as
+   IF-STATUS reading a missing interface as inactive/nil."
+  (let ((output (ignore-errors
+                 (with-output-to-string (s)
+                   (sb-ext:run-program "/sbin/route" (list "-n" "get" "default")
+                                       :output s :error nil :wait t)))))
+    (unless output (return-from current-gateway nil))
+    (let* ((lines (uiop:split-string output :separator '(#\Newline)))
+           (gw-line (find-if (lambda (l) (search "gateway:" l)) lines)))
+      (when gw-line
+        (let ((gw (string-trim '(#\Space #\Tab)
+                               (second (uiop:split-string gw-line :separator '(#\:))))))
+          (when (plusp (length gw)) gw))))))
 
 
 (defun full-reconfigure (reason)
@@ -224,23 +253,57 @@
     (multiple-value-bind (if-status0 if-ip0) (if-status)
       (let ((last-if-status if-status0)
             (last-if-ip if-ip0)
+            (last-gateway (current-gateway))
             (last-tick (get-universal-time)))
         (loop while *running* do
               (sleep *poll-interval*)
-              (let ((now (get-universal-time)))
+              (let* ((now (get-universal-time))
+                     (gap-seconds (- now last-tick))
+                     (gap-p (sleep-gap-p last-tick now)))
                 (multiple-value-bind (cur-if-status cur-if-ip) (if-status)
-                  (let ((reason (detect-network-change last-if-status last-if-ip last-tick
-                                                       now cur-if-status cur-if-ip)))
+                  (let ((reason (detect-network-change last-if-status last-if-ip
+                                                       cur-if-status cur-if-ip)))
+                    ;; last-tick is overwritten to now right here — gap-seconds above
+                    ;; is captured first so later log lines don't show a bogus "0s".
                     (setf last-if-status cur-if-status last-if-ip cur-if-ip last-tick now)
                     (cond
+                      ;; ifconfig itself proved something changed — act on it directly.
                       ;; Reconfigure only after an active interface can supply a gateway.
                       ((and reason (string= cur-if-status "active") (eq *regime* :tunnel))
                        (full-reconfigure reason)
+                       (setf last-gateway (current-gateway))
                        ;; A network change does not count as a pool failure.
                        (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                       (reason
                        (format t "~&[dog] network change (~a) noted, not reconfiguring~%" reason))
+                      ;; Suspected sleep/wake: a time gap alone is not proof. Confirm
+                      ;; against the actual default gateway before paying for a full
+                      ;; teardown+rebuild — most short sleeps come back to the same one.
+                      ((and gap-p (eq *regime* :tunnel))
+                       (format t "~&[dog] ~as gap since last check, likely sleep/wake — confirming gateway~%"
+                               gap-seconds)
+                       (sleep *settle-delay*)
+                       (let ((cur-gateway (current-gateway)))
+                         (cond
+                           ((null cur-gateway)
+                            ;; Can't confirm either way — reconfiguring is the safe
+                            ;; default here, same spirit as the old unconditional path.
+                            (format t "~&[dog] gateway unreadable after gap, reconfiguring to be safe~%")
+                            (full-reconfigure "sleep/wake gap, gateway unreadable")
+                            (setf last-gateway (current-gateway))
+                            (setf fail-count 0 ok-count 0 *sweep-tries* 0))
+                           ((equal cur-gateway last-gateway)
+                            (format t "~&[dog] gateway unchanged (~a) after gap, skipping reconfigure~%"
+                                    cur-gateway))
+                           (t
+                            (full-reconfigure (format nil "gateway changed ~a -> ~a after sleep/wake gap"
+                                                      last-gateway cur-gateway))
+                            (setf last-gateway cur-gateway)
+                            (setf fail-count 0 ok-count 0 *sweep-tries* 0)))))
                       (t
+                       ;; Quiet tick: keep our notion of the current gateway fresh so
+                       ;; the next gap (if any) has an accurate baseline to compare to.
+                       (setf last-gateway (or (current-gateway) last-gateway))
                        (ecase *regime*
                          (:tunnel (setf fail-count (tick-tunnel fail-count)))
                          (:direct (setf ok-count (tick-direct ok-count))))))))))))))
@@ -293,4 +356,3 @@
   (when (and *thread* (sb-thread:thread-alive-p *thread*))
     (sb-thread:join-thread *thread* :default nil))
   (stop-full))
-  
