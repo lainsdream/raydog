@@ -327,6 +327,19 @@
                        (setf last-gateway (current-gateway))
                        ;; A network change does not count as a pool failure.
                        (setf fail-count 0 ok-count 0 *sweep-tries* 0))
+                      ;; Interface is down (Wi-Fi off, etc) — there's no network at
+                      ;; all, not "every server died". local-plumbing-alive-p alone
+                      ;; can't tell these apart (utun/tun2socks are still alive with
+                      ;; no Wi-Fi), so without this branch tick-tunnel would burn
+                      ;; through the whole pool via server-alive-p failures that are
+                      ;; guaranteed to fail regardless of which server it's pointed
+                      ;; at. Skip all checks and hold the counters at zero until the
+                      ;; interface comes back — the (reason ...) / gap-p / (t ...)
+                      ;; branches below are for when there IS a network to check.
+                      ((string= cur-if-status "inactive")
+                       (when reason
+                         (format t "~&[dog] ~a — interface inactive, pausing checks~%" reason))
+                       (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                       (reason
                        (format t "~&[dog] network change (~a) noted, not reconfiguring~%" reason))
                       ;; Suspected sleep/wake: a time gap alone is not proof. Confirm
