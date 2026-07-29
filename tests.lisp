@@ -39,9 +39,26 @@
          (format t "~&FAIL ~a~%     expected an error, form returned normally~%" ,label)))))
 
 
+(defparameter *tests* nil
+  "Names of all DEFTEST-defined test functions, in definition order.
+   Populated by DEFTEST as this file loads; RUN-TESTS just walks it.")
+
+(defmacro deftest (name &body body)
+  "Like DEFUN, but also registers NAME in *TESTS* so RUN-TESTS picks it
+   up automatically — adding a test is just (deftest test-foo ...), no
+   separate call to add anywhere else, so a new test can't silently go
+   unrun by forgetting to list it. Re-loading this file (e.g. re-running
+   (load \"tests.lisp\") in a live REPL) redefines the same names in
+   place; PUSHNEW keeps *TESTS* from growing a duplicate entry each time."
+  `(progn
+     (defun ,name () ,@body)
+     (pushnew ',name *tests*)
+     ',name))
+
+
 ;;; --- b64-decode ---
 
-(defun test-b64-decode ()
+(deftest test-b64-decode ()
   (check "b64-decode: padded"        (b64-decode "SGVsbG8=") "Hello")
   (check "b64-decode: no padding"    (b64-decode "SGVsbG8")  "Hello")
   (check "b64-decode: url-safe -_"   (b64-decode "-_") (b64-decode "+/"))
@@ -50,7 +67,7 @@
 
 ;;; --- url-decode ---
 
-(defun test-url-decode ()
+(deftest test-url-decode ()
   (check "url-decode: plain passthrough" (url-decode "hello") "hello")
   (check "url-decode: percent-escape"    (url-decode "a%20b") "a b")
   (check "url-decode: trailing literal %" (url-decode "100%") "100%"))
@@ -58,7 +75,7 @@
 
 ;;; --- split-once / split-last / str-split / parse-query ---
 
-(defun test-splitting ()
+(deftest test-splitting ()
   (check "split-once: found"     (multiple-value-list (split-once "a:b:c" #\:)) '("a" "b:c"))
   (check "split-once: not found" (multiple-value-list (split-once "abc" #\:))   '("abc" nil))
   (check "split-last: found"     (multiple-value-list (split-last "a:b:c" #\:)) '("a:b" "c"))
@@ -89,7 +106,7 @@
 
 ;;; --- parse-vless ---
 
-(defun test-parse-vless ()
+(deftest test-parse-vless ()
   (let ((cfg (parse-vless
               "vless://uuid-123@example.com:443?security=reality&sni=foo.com&pbk=KEY&sid=1a&fp=chrome#My%20Server")))
     (check "vless: host"     (proxy-config-host cfg) "example.com")
@@ -107,7 +124,7 @@
 ;;; Shares parse-simple-uri with parse-vless, so this mostly exercises the
 ;;; bits that differ: password instead of uuid, and the tls-by-default extra.
 
-(defun test-parse-trojan ()
+(deftest test-parse-trojan ()
   (let ((cfg (parse-trojan
               "trojan://s3cret@example.com:443?sni=foo.com&type=ws&path=%2Fws&host=cdn.com#My%20Trojan")))
     (check "trojan: host"     (proxy-config-host cfg) "example.com")
@@ -134,7 +151,7 @@
 ;;; (UUID-shaped or base64-ish with +/= in it — never url-decoded, same as
 ;;; trojan's password).
 
-(defun test-parse-hysteria2 ()
+(deftest test-parse-hysteria2 ()
   (let ((cfg (parse-hysteria2
               "hysteria2://s3cret@example.com:8443?sni=foo.com&insecure=1#My%20Server")))
     (check "hysteria2: host"     (proxy-config-host cfg) "example.com")
@@ -157,7 +174,7 @@
 
 ;;; --- parse-vmess ---
 
-(defun test-parse-vmess ()
+(deftest test-parse-vmess ()
   ;; ws + tls, all fields present.
   (let ((cfg (parse-vmess
               (format nil "vmess://~a"
@@ -203,7 +220,7 @@
 
 ;;; --- parse-shadowsocks ---
 
-(defun test-parse-shadowsocks ()
+(deftest test-parse-shadowsocks ()
   ;; Modern form, plain "method:password" userinfo (contains a colon, so
   ;; not base64-decoded).
   (let ((cfg (parse-shadowsocks "ss://chacha20-ietf-poly1305:secret@1.2.3.4:8080#tag1")))
@@ -230,7 +247,7 @@
 
 ;;; --- parse-config-uri dispatch ---
 
-(defun test-parse-config-uri ()
+(deftest test-parse-config-uri ()
   (check "dispatch: vless kind"  (proxy-config-kind (parse-config-uri "vless://u@h:1")) :vless)
   (check "dispatch: ss kind"     (proxy-config-kind (parse-config-uri "ss://m:p@h:1")) :shadowsocks)
   (check "dispatch: trojan kind" (proxy-config-kind (parse-config-uri "trojan://p@h:1")) :trojan)
@@ -249,7 +266,7 @@
 
 ;;; --- json-write ---
 
-(defun test-json-write ()
+(deftest test-json-write ()
   (check "json: string escaping"
          (with-output-to-string (s) (json-write "a\"b\\c" s))
          "\"a\\\"b\\\\c\"")
@@ -266,7 +283,7 @@
 
 ;;; --- json-parse (needed for vmess, which is base64+JSON rather than a query string) ---
 
-(defun test-json-parse ()
+(deftest test-json-parse ()
   (check "json-parse: string with escapes"
          (json-parse "\"a\\\"b\\\\c\\n\"") "a\"b\\c
 ")
@@ -299,7 +316,7 @@
 
 ;;; --- build-singbox-config (end-to-end sanity, not a full schema check) ---
 
-(defun test-build-singbox-config ()
+(deftest test-build-singbox-config ()
   (let* ((cfg (parse-config-uri "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwdw==@1.2.3.4:8080"))
          (out (with-output-to-string (s) (json-write (build-singbox-config cfg) s))))
     (check "singbox config: outbound tag present"
@@ -350,18 +367,13 @@
 
 
 (defun run-tests ()
+  "Runs every DEFTEST in the order they were defined in this file (*TESTS*
+   is built by PUSHNEW, so it comes out reversed relative to definition
+   order — REVERSE here restores that instead of running bottom-to-top)."
   (setf *fail-count* 0 *check-count* 0)
-  (test-b64-decode)
-  (test-url-decode)
-  (test-splitting)
-  (test-parse-vless)
-  (test-parse-trojan)
-  (test-parse-hysteria2)
-  (test-parse-vmess)
-  (test-parse-shadowsocks)
-  (test-parse-config-uri)
-  (test-json-write)
-  (test-json-parse)
-  (test-build-singbox-config)
+  (dolist (test (reverse *tests*))
+    (funcall test))
   (format t "~&[tests] ~a/~a passed~%" (- *check-count* *fail-count*) *check-count*)
   (zerop *fail-count*))
+
+(run-tests)

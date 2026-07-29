@@ -124,6 +124,23 @@
      (write-char #\] stream))
     (t (error "bad json obj: ~s" obj))))
 
+(defmacro json-fields (&rest kvs)
+  "(json-fields \"a\" 1 \"b\" 2) => (list (cons \"a\" 1) (cons \"b\" 2)).
+   Pure syntax sugar: expands to exactly what was being written by hand
+   everywhere below, so json-write needs no changes. Exists because the
+   (list (cons \"k\" v) (cons \"k2\" v2) ...) shape shows up dozens of
+   times in this file and the cons/list noise was burying the actual
+   field names being sent to sing-box."
+  `(list ,@(loop for (k v) on kvs by #'cddr collect `(cons ,k ,v))))
+
+(defmacro json-obj (&rest kvs)
+  "(json-obj \"a\" 1 \"b\" 2) => (cons :obj (json-fields \"a\" 1 \"b\" 2)).
+   Use this for a complete, non-appended JSON object; use JSON-FIELDS
+   directly when the fields need to be spliced together with APPEND
+   alongside conditionally-included ones (see the *-outbound-singbox
+   functions below for that pattern)."
+  `(cons :obj (json-fields ,@kvs)))
+
 (defun json-skip-ws (str i)
   (loop while (and (< i (length str))
                     (member (char str i) '(#\Space #\Tab #\Newline #\Return)))
@@ -386,30 +403,25 @@
   "Returns an alist of (\"tls\" . <obj>) or nil if there's no TLS at all."
   (cond
     ((string= security "reality")
-     (list
-      (cons "tls"
-            (list :obj
-                  (cons "enabled" t)
-                  (cons "server_name" (qval extra "sni" ""))
-                  (cons "utls" (list :obj
-                                     (cons "enabled" t)
-                                     (cons "fingerprint" (qval extra "fp" "chrome"))))
-                  (cons "reality" (list :obj
-                                        (cons "enabled" t)
-                                        (cons "public_key" (qval extra "pbk" ""))
-                                        (cons "short_id" (qval extra "sid" ""))))))))
+     (json-fields
+      "tls" (json-obj
+             "enabled" t
+             "server_name" (qval extra "sni" "")
+             "utls" (json-obj "enabled" t
+                               "fingerprint" (qval extra "fp" "chrome"))
+             "reality" (json-obj "enabled" t
+                                  "public_key" (qval extra "pbk" "")
+                                  "short_id" (qval extra "sid" "")))))
     ((string= security "tls")
      (let ((insecure (or (string= (qval extra "allowInsecure" "0") "1")
                          (string= (qval extra "insecure" "0") "1"))))
-       (list
-        (cons "tls"
-              (list :obj
-                    (cons "enabled" t)
-                    (cons "server_name" (qval extra "sni" (proxy-config-host cfg)))
-                    (cons "insecure" (if insecure t :false))
-                    (cons "utls" (list :obj
-                                       (cons "enabled" t)
-                                       (cons "fingerprint" (qval extra "fp" "chrome")))))))))
+       (json-fields
+        "tls" (json-obj
+               "enabled" t
+               "server_name" (qval extra "sni" (proxy-config-host cfg))
+               "insecure" (if insecure t :false)
+               "utls" (json-obj "enabled" t
+                                 "fingerprint" (qval extra "fp" "chrome"))))))
     (t nil)))
 
 (defun singbox-transport-fields (extra network default-host)
@@ -419,16 +431,16 @@
    other clients (v2rayN/Xray) do for CDN-fronted configs."
   (cond
     ((string= network "ws")
-     (list (cons "transport"
-                 (list :obj
-                       (cons "type" "ws")
-                       (cons "path" (qval extra "path" "/"))
-                       (cons "headers" (list :obj (cons "Host" (qval extra "host" default-host))))))))
+     (json-fields
+      "transport" (json-obj
+                   "type" "ws"
+                   "path" (qval extra "path" "/")
+                   "headers" (json-obj "Host" (qval extra "host" default-host)))))
     ((string= network "grpc")
-     (list (cons "transport"
-                 (list :obj
-                       (cons "type" "grpc")
-                       (cons "service_name" (qval extra "serviceName" ""))))))
+     (json-fields
+      "transport" (json-obj
+                   "type" "grpc"
+                   "service_name" (qval extra "serviceName" ""))))
     (t nil)))
 
 (defun ws-fallback-host (cfg extra)
@@ -443,13 +455,13 @@
          (flow     (qval extra "flow" "")))
     (cons :obj
           (append
-           (list (cons "type" "vless")
-                 (cons "tag" "proxy")
-                 (cons "server" (proxy-config-host cfg))
-                 (cons "server_port" (proxy-config-port cfg))
-                 (cons "uuid" (proxy-config-uuid cfg)))
+           (json-fields "type" "vless"
+                        "tag" "proxy"
+                        "server" (proxy-config-host cfg)
+                        "server_port" (proxy-config-port cfg)
+                        "uuid" (proxy-config-uuid cfg))
            ;; Omit empty flow: sing-box distinguishes it from an absent field.
-           (when (plusp (length flow)) (list (cons "flow" flow)))
+           (when (plusp (length flow)) (json-fields "flow" flow))
            (singbox-tls-fields cfg extra security)
            (singbox-transport-fields extra network (ws-fallback-host cfg extra))))))
 
@@ -459,11 +471,11 @@
          (security (qval extra "security" "tls")))
     (cons :obj
           (append
-           (list (cons "type" "trojan")
-                 (cons "tag" "proxy")
-                 (cons "server" (proxy-config-host cfg))
-                 (cons "server_port" (proxy-config-port cfg))
-                 (cons "password" (proxy-config-password cfg)))
+           (json-fields "type" "trojan"
+                        "tag" "proxy"
+                        "server" (proxy-config-host cfg)
+                        "server_port" (proxy-config-port cfg)
+                        "password" (proxy-config-password cfg))
            (singbox-tls-fields cfg extra security)
            (singbox-transport-fields extra network (ws-fallback-host cfg extra))))))
 
@@ -474,26 +486,27 @@
          (alter-id    (or (parse-integer (qval extra "alterId" "0") :junk-allowed t) 0)))
     (cons :obj
           (append
-           (list (cons "type" "vmess")
-                 (cons "tag" "proxy")
-                 (cons "server" (proxy-config-host cfg))
-                 (cons "server_port" (proxy-config-port cfg))
-                 (cons "uuid" (proxy-config-uuid cfg))
-                 ;; sing-box's vmess "security" is the AEAD cipher (auto/aes-128-gcm/...),
-                 ;; not to be confused with tls-status (TLS on/off) below.
-                 (cons "security" (proxy-config-method cfg))
-                 (cons "alter_id" alter-id))
+           (json-fields
+            "type" "vmess"
+            "tag" "proxy"
+            "server" (proxy-config-host cfg)
+            "server_port" (proxy-config-port cfg)
+            "uuid" (proxy-config-uuid cfg)
+            ;; sing-box's vmess "security" is the AEAD cipher (auto/aes-128-gcm/...),
+            ;; not to be confused with tls-status (TLS on/off) below.
+            "security" (proxy-config-method cfg)
+            "alter_id" alter-id)
            (singbox-tls-fields cfg extra tls-status)
            (singbox-transport-fields extra network (ws-fallback-host cfg extra))))))
 
 (defun shadowsocks-outbound-singbox (cfg)
-  (list :obj
-        (cons "type" "shadowsocks")
-        (cons "tag" "proxy")
-        (cons "server" (proxy-config-host cfg))
-        (cons "server_port" (proxy-config-port cfg))
-        (cons "method" (proxy-config-method cfg))
-        (cons "password" (proxy-config-password cfg))))
+  (json-obj
+   "type" "shadowsocks"
+   "tag" "proxy"
+   "server" (proxy-config-host cfg)
+   "server_port" (proxy-config-port cfg)
+   "method" (proxy-config-method cfg)
+   "password" (proxy-config-password cfg)))
 
 (defun hysteria2-outbound-singbox (cfg)
   "Hysteria2 is TLS-by-definition (no security= toggle like vless/trojan),
@@ -507,20 +520,17 @@
          (obfs-pw  (qval extra "obfs-password" "")))
     (cons :obj
           (append
-           (list (cons "type" "hysteria2")
-                 (cons "tag" "proxy")
-                 (cons "server" (proxy-config-host cfg))
-                 (cons "server_port" (proxy-config-port cfg))
-                 (cons "password" (proxy-config-password cfg)))
+           (json-fields "type" "hysteria2"
+                        "tag" "proxy"
+                        "server" (proxy-config-host cfg)
+                        "server_port" (proxy-config-port cfg)
+                        "password" (proxy-config-password cfg))
            (when (plusp (length obfs))
-             (list (cons "obfs" (list :obj
-                                       (cons "type" obfs)
-                                       (cons "password" obfs-pw)))))
-           (list (cons "tls"
-                       (list :obj
-                             (cons "enabled" t)
-                             (cons "server_name" (qval extra "sni" (proxy-config-host cfg)))
-                             (cons "insecure" (if insecure t :false)))))))))
+             (json-fields "obfs" (json-obj "type" obfs "password" obfs-pw)))
+           (json-fields "tls" (json-obj
+                               "enabled" t
+                               "server_name" (qval extra "sni" (proxy-config-host cfg))
+                               "insecure" (if insecure t :false)))))))
 
 (defun proxy-outbound-singbox (cfg)
   (ecase (proxy-config-kind cfg)
@@ -535,24 +545,17 @@
 ;;; (e.g. the speedtest script) pass their own free port instead.
 
 (defun build-singbox-config (cfg &key (socks-port 1080))
-  (list :obj
-        (cons "log" (list :obj (cons "level" "warn")))
-        (cons "dns"
-              (list :obj
-                    (cons "servers"
-                          (list :arr
-                                (list :obj
-                                      (cons "tag" "proxy-dns")
-                                      (cons "type" "https")
-                                      (cons "server" "1.1.1.1")
-                                      (cons "detour" "proxy"))))))
-        (cons "inbounds"
-              (list :arr
-                    (list :obj
-                          (cons "type" "mixed")
-                          (cons "listen" "127.0.0.1")
-                          (cons "listen_port" socks-port))))
-        (cons "outbounds" (list :arr (proxy-outbound-singbox cfg)))))
+  (json-obj
+   "log" (json-obj "level" "warn")
+   "dns" (json-obj
+          "servers" (list :arr (json-obj "tag" "proxy-dns"
+                                          "type" "https"
+                                          "server" "1.1.1.1"
+                                          "detour" "proxy")))
+   "inbounds" (list :arr (json-obj "type" "mixed"
+                                    "listen" "127.0.0.1"
+                                    "listen_port" socks-port))
+   "outbounds" (list :arr (proxy-outbound-singbox cfg))))
 
 
 (defun read-uri-lines (txt-path)
