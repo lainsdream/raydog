@@ -236,29 +236,57 @@
   (format t "~&[dog] reconfigure done~%"))
 
 
+(defun local-plumbing-alive-p ()
+  "Cheap, no-network liveness check for the local tunnel machinery itself:
+   does the TUN interface still exist, and is tun2socks still running.
+   Unlike server-alive-p (raw reachability to the proxy, which bypasses
+   the TUN and so can't see tun2socks/utun dying) or tunnel-functional-p
+   (a real network round-trip, reserved for the heavier post-sleep gap
+   check), this only shells out to ifconfig/pgrep — safe to run on every
+   single tick without adding constant background network traffic.
+   Exists because tun2socks/utun can die silently *between* ticks, not
+   just at a detected sleep/wake gap or interface change — server-alive-p
+   alone would never notice that."
+  (and (ignore-errors (tun-interface-up-p *tun-name*))
+       (ignore-errors
+        (plusp (length (string-trim '(#\Newline #\Space #\Return)
+                                     (with-output-to-string (s)
+                                       (sb-ext:run-program "/usr/bin/pgrep" (list "-f" "lisp-vpn-tun2socks")
+                                                           :output s :error nil :wait t))))))))
+
 (defun tick-tunnel (fail-count)
   "One liveness check while *regime* is :tunnel. Returns the new
    fail-count. On repeated failure, rotates to the next pool entry, or —
    once every entry has failed in this sweep — falls back to :direct."
-  (if (server-alive-p)
-      (progn (setf *sweep-tries* 0) 0)
-      (let ((fail-count (1+ fail-count)))
-        (format t "~&[dog] server unreachable ~a/~a~%" fail-count *fail-threshold*)
-        (when (>= fail-count *fail-threshold*)
-          (incf *sweep-tries*)
-          (format t "~&[dog] pool entry ~a (~a) presumed dead (sweep ~a/~a)~%"
-                  *pool-index* (getf (nth *pool-index* *config-pool*) :label)
-                  *sweep-tries* (length *config-pool*))
-          (setf fail-count 0)
-          (if (>= *sweep-tries* (length *config-pool*))
-              ;; Fall back only after every pool entry fails.
-              (progn
-                (format t "~&[dog] whole pool exhausted, falling back to direct~%")
-                (ignore-errors (stop-full))
-                (setf *sweep-tries* 0 *regime* :direct))
-              (let ((next (mod (1+ *pool-index*) (length *config-pool*))))
-                (ignore-errors (switch-to-config next)))))
-        fail-count)))
+  (if (not (local-plumbing-alive-p))
+      ;; The local pipeline itself (TUN interface / tun2socks) is gone —
+      ;; this is not "proxy is down" (server-alive-p wouldn't even catch
+      ;; it, see above), so a plain reconfigure is the right fix, not a
+      ;; pool rotation to a different server.
+      (progn
+        (format t "~&[dog] local tunnel plumbing dead (interface/tun2socks gone) — reconfiguring~%")
+        (ignore-errors (full-reconfigure "tun2socks/interface vanished mid-tunnel"))
+        (setf *sweep-tries* 0)
+        0)
+      (if (server-alive-p)
+          (progn (setf *sweep-tries* 0) 0)
+          (let ((fail-count (1+ fail-count)))
+            (format t "~&[dog] server unreachable ~a/~a~%" fail-count *fail-threshold*)
+            (when (>= fail-count *fail-threshold*)
+              (incf *sweep-tries*)
+              (format t "~&[dog] pool entry ~a (~a) presumed dead (sweep ~a/~a)~%"
+                      *pool-index* (getf (nth *pool-index* *config-pool*) :label)
+                      *sweep-tries* (length *config-pool*))
+              (setf fail-count 0)
+              (if (>= *sweep-tries* (length *config-pool*))
+                  ;; Fall back only after every pool entry fails.
+                  (progn
+                    (format t "~&[dog] whole pool exhausted, falling back to direct~%")
+                    (ignore-errors (stop-full))
+                    (setf *sweep-tries* 0 *regime* :direct))
+                  (let ((next (mod (1+ *pool-index*) (length *config-pool*))))
+                    (ignore-errors (switch-to-config next)))))
+            fail-count))))
 
 (defun tick-direct (ok-count)
   "One liveness check while *regime* is :direct. Returns the new
@@ -290,9 +318,7 @@
                 (multiple-value-bind (cur-if-status cur-if-ip) (if-status)
                   (let ((reason (detect-network-change last-if-status last-if-ip
                                                        cur-if-status cur-if-ip)))
-                    ;; last-tick is overwritten to now right here — gap-seconds above
-                    ;; is captured first so later log lines don't show a bogus "0s".
-                    (setf last-if-status cur-if-status last-if-ip cur-if-ip last-tick now)
+                    (setf last-if-status cur-if-status last-if-ip cur-if-ip)
                     (cond
                       ;; ifconfig itself proved something changed — act on it directly.
                       ;; Reconfigure only after an active interface can supply a gateway.
@@ -343,7 +369,15 @@
                        (setf last-gateway (or (current-gateway) last-gateway))
                        (ecase *regime*
                          (:tunnel (setf fail-count (tick-tunnel fail-count)))
-                         (:direct (setf ok-count (tick-direct ok-count))))))))))))))
+                         (:direct (setf ok-count (tick-direct ok-count))))))
+                    ;; Stamped last, after all of the above (including any blocking
+                    ;; full-reconfigure) has finished — gap-seconds on the NEXT tick
+                    ;; must measure real idle time between checks, not the time this
+                    ;; tick itself spent reconfiguring. Stamping this at the top of
+                    ;; the tick (before reconfigure ran) made every reconfigure look
+                    ;; like a fresh sleep/wake gap on the following tick, which kept
+                    ;; re-triggering itself into an infinite reconfigure loop.
+                    (setf last-tick (get-universal-time))))))))))
 
 
 (defun watch ()

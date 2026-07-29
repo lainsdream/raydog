@@ -62,7 +62,7 @@
   (format t "~&Full TUN setup complete~%"))
 
 (defun stop-full ()
-  (teardown-routes)
-  (stop-tun)
-  (stop)
+  (ignore-errors (teardown-routes))
+  (ignore-errors (stop-tun))
+  (ignore-errors (stop))
   (format t "~&Routes restored~%"))
