@@ -54,6 +54,37 @@
   (privileged "stop-tun")
   (format t "~&tun2socks stopped~%"))
 
+(defun reassert-default-route ()
+  "Re-points the kernel's default route at TUN_IP without touching the
+   captured original gateway or the proxy host route — unlike
+   setup-routes, safe to call again even though GWFILE already exists.
+   Needed because macOS drops the default route entry when the utun
+   interface it points through is destroyed (which stop-tun does, since
+   killing tun2socks tears down the utun device with it) — so recreating
+   utun9 via start-tun brings the interface back with the same IP, but
+   nothing re-points default at it until this runs."
+  (privileged "reassert-default"))
+
+(defun restart-tun2socks ()
+  "Restarts just tun2socks (stop-tun + start-tun + assign-tun-ip +
+   reassert-default-route) without touching setup-routes/teardown-routes
+   or the captured gateway. This is the targeted fix for tun2socks's
+   SOCKS5 UDP ASSOCIATE session dying across a sleep/wake gap (breaking
+   UDP — in particular DNS — while ordinary TCP keeps working, since
+   each TCP connection opens fresh): the interface disappears and comes
+   back via stop-tun/start-tun, which is enough to reset that session,
+   without paying for a full teardown+rebuild of the gateway capture or
+   proxy host route, which were never actually broken.
+
+   reassert-default-route is not optional here — without it the
+   interface comes back but nothing sends traffic through it at all,
+   since the kernel default route was dropped along with the old utun9."
+  (ignore-errors (stop-tun))
+  (start-tun)
+  (assign-tun-ip)
+  (reassert-default-route)
+  (format t "~&[dog] tun2socks restarted~%"))
+
 (defun start-full ()
   (start)
   (start-tun)

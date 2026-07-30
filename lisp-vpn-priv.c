@@ -167,6 +167,35 @@ int main(int argc, char **argv) {
     if (argc != 3 || !tun_name(argv[2])) die("usage: assign-tun utunN");
     char *const cmd[] = { IFCONFIG, argv[2], TUN_IP, TUN_IP, "up", NULL }; run_wait(cmd); return 0;
   }
+  if (!strcmp(argv[1], "reassert-default")) {
+    /* macOS drops the kernel default route entry when the utun interface
+       it points through is destroyed (e.g. tun2socks exiting tears down
+       its utun device). start-tun/assign-tun bring the interface back
+       with the same TUN_IP, but nothing re-points default at it — this
+       does exactly that step, alone. Deliberately does not touch GWFILE
+       or the proxy host route: those were never broken, only the
+       default route entry was, so setup-routes (which would also try to
+       recapture the gateway and re-add the host route) is the wrong
+       tool here and would just die on "gateway already captured".
+
+       ADD works when there is currently no default route at all (the
+       case this exists for); CHANGE works when one exists but points
+       somewhere else. Try both unconditionally rather than branching on
+       either's exit status — observed in practice: a failed CHANGE
+       ("not in table") can still exit 0, so trusting that exit code to
+       decide whether to fall back to ADD silently does nothing. The
+       only trustworthy check is reading the routing table back after. */
+    if (argc != 2) die("usage: reassert-default");
+    char *const add[] = { ROUTE, "-n", "add", "default", TUN_IP, NULL };
+    run_wait_soft(add);
+    char *const change[] = { ROUTE, "-n", "change", "default", TUN_IP, NULL };
+    run_wait_soft(change);
+    char gw[64];
+    if (!capture_default_gateway(gw, sizeof(gw)) || strcmp(gw, TUN_IP) != 0)
+      die("reassert-default: default route still not pointing at TUN_IP "
+          "after add+change — check `route -n get default` by hand");
+    return 0;
+  }
 
   if (!strcmp(argv[1], "setup-routes")) {
     if (argc != 3 || !ipv4(argv[2])) die("usage: setup-routes proxy-IPv4");

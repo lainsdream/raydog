@@ -147,9 +147,32 @@
    proxy's own reachability over a route that bypasses the TUN), this is
    the one check that can detect a dead/vanished utun interface or a
    wedged tun2socks after sleep/wake, where the route table still points
-   at TUN_IP but nothing is actually forwarding through it."
+   at TUN_IP but nothing is actually forwarding through it.
+
+   NOTE: this only proves TCP works. A TCP CONNECT through SOCKS5 is
+   opened fresh every time, so this can't see a dead SOCKS5 UDP ASSOCIATE
+   session — see DNS-OVER-UDP-ALIVE-P for the check that can."
   (and (ignore-errors (tun-interface-up-p *tun-name*))
        (ignore-errors (port-open-p *tunnel-check-host* *tunnel-check-port* :timeout 3))))
+
+(defun dns-over-udp-alive-p (&key (host *tunnel-check-host*) (timeout 2))
+  "True if a real UDP DNS query to HOST:53 gets an answer within TIMEOUT
+   seconds. This is the check that can see the specific failure this
+   project has been chasing: SOCKS5's UDP ASSOCIATE session (which
+   tun2socks needs for anything UDP, including DNS) can die across a
+   sleep/wake gap while ordinary TCP CONNECT sessions — including the
+   one TUNNEL-FUNCTIONAL-P uses — keep working, since each TCP
+   connection opens fresh and shares none of that state. A tunnel that
+   passes TUNNEL-FUNCTIONAL-P but fails this is exactly 'processes and
+   interface look fine, TCP works, but there is no internet.'
+   Uses /usr/bin/dig, which ships with macOS. Queries cloudflare.com as
+   a placeholder — the answer's content doesn't matter, only whether a
+   NOERROR reply comes back at all within TIMEOUT."
+  (let ((lines (run-program-lines "/usr/bin/dig"
+                                  (list (format nil "@~a" host)
+                                        (format nil "+time=~a" timeout)
+                                        "+tries=1" "cloudflare.com"))))
+    (and lines (some (lambda (l) (search "status: NOERROR" l)) lines))))
 
 (defun switch-to-config (index)
   "Point everything at *config-pool* entry INDEX and bring the tunnel up
@@ -217,12 +240,28 @@
 (defun current-gateway ()
   "Returns the current default gateway IPv4 as a string, or nil if it
    can't be determined (no default route, /sbin/route missing/erred, or
-   unparseable output). Used to confirm a suspected sleep/wake gap
-   actually changed something real, instead of trusting the gap alone.
-   Never errors — a failure to read just reads as nil, same spirit as
-   IF-STATUS reading a missing interface as inactive/nil."
+   unparseable output).
+
+   NOT safe to use for sleep/wake gateway confirmation while *REGIME* is
+   :TUNNEL — SETUP-ROUTES has already pointed the kernel's default route
+   at TUN_IP by then, so this always reads back 198.18.0.1 regardless of
+   what the real upstream router is doing. It answers 'what is the
+   default route right now', which during a tunnel is a constant, not a
+   useful signal. See PHYSICAL-GATEWAY for the check that actually
+   reflects the network underneath the tunnel."
   (let* ((lines (run-program-lines "/sbin/route" (list "-n" "get" "default")))
          (gw (field-at (find-if (lambda (l) (search "gateway:" l)) lines) #\: 1)))
+    (when (and gw (plusp (length gw))) gw)))
+
+(defun physical-gateway (interface)
+  "Returns INTERFACE's real upstream router IPv4 (from its DHCP lease),
+   or nil if it can't be determined. Unlike CURRENT-GATEWAY, this reads
+   ipconfig's cached lease info directly rather than the kernel routing
+   table, so it isn't affected by SETUP-ROUTES having overridden the
+   default route to TUN_IP — it keeps seeing the actual router even
+   while the tunnel is up."
+  (let* ((lines (run-program-lines "/usr/sbin/ipconfig" (list "getoption" interface "router")))
+         (gw (and lines (string-trim '(#\Space #\Tab #\Return) (first lines)))))
     (when (and gw (plusp (length gw))) gw)))
 
 
@@ -308,7 +347,7 @@
     (multiple-value-bind (if-status0 if-ip0) (if-status)
       (let ((last-if-status if-status0)
             (last-if-ip if-ip0)
-            (last-gateway (current-gateway))
+            (last-gateway (physical-gateway *watched-interface*))
             (last-tick (get-universal-time)))
         (loop while *running* do
               (sleep *poll-interval*)
@@ -324,7 +363,7 @@
                       ;; Reconfigure only after an active interface can supply a gateway.
                       ((and reason (string= cur-if-status "active") (eq *regime* :tunnel))
                        (full-reconfigure reason)
-                       (setf last-gateway (current-gateway))
+                       (setf last-gateway (physical-gateway *watched-interface*))
                        ;; A network change does not count as a pool failure.
                        (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                       ;; Interface is down (Wi-Fi off, etc) — there's no network at
@@ -349,37 +388,49 @@
                        (format t "~&[dog] ~as gap since last check, likely sleep/wake — confirming gateway~%"
                                gap-seconds)
                        (sleep *settle-delay*)
-                       (let ((cur-gateway (current-gateway)))
+                       (let ((cur-gateway (physical-gateway *watched-interface*)))
                          (cond
                            ((null cur-gateway)
                             ;; Can't confirm either way — reconfiguring is the safe
                             ;; default here, same spirit as the old unconditional path.
                             (format t "~&[dog] gateway unreadable after gap, reconfiguring to be safe~%")
                             (full-reconfigure "sleep/wake gap, gateway unreadable")
-                            (setf last-gateway (current-gateway))
+                            (setf last-gateway (physical-gateway *watched-interface*))
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                            ((not (equal cur-gateway last-gateway))
                             (full-reconfigure (format nil "gateway changed ~a -> ~a after sleep/wake gap"
                                                       last-gateway cur-gateway))
                             (setf last-gateway cur-gateway)
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0))
-                           ((tunnel-functional-p)
-                            (format t "~&[dog] gateway unchanged (~a) and tunnel functional, skipping reconfigure~%"
-                                    cur-gateway))
-                           (t
-                            ;; Gateway address unchanged (still TUN_IP) says nothing
-                            ;; about whether utun/tun2socks itself survived the gap —
-                            ;; only an end-to-end check through tunnel-functional-p can
-                            ;; catch that. Reconfigure since the plumbing is dead.
+                           ((not (tunnel-functional-p))
+                            ;; Gateway address unchanged says nothing about
+                            ;; whether utun/tun2socks itself survived the gap —
+                            ;; only an end-to-end check through
+                            ;; tunnel-functional-p can catch that. Reconfigure
+                            ;; since the plumbing is dead.
                             (format t "~&[dog] gateway unchanged (~a) but tunnel not functional after gap, reconfiguring~%"
                                     cur-gateway)
                             (full-reconfigure "sleep/wake gap, tunnel not functional")
-                            (setf last-gateway (current-gateway))
-                            (setf fail-count 0 ok-count 0 *sweep-tries* 0)))))
+                            (setf last-gateway (physical-gateway *watched-interface*))
+                            (setf fail-count 0 ok-count 0 *sweep-tries* 0))
+                           ((not (dns-over-udp-alive-p))
+                            ;; TCP through the tunnel is fine, but UDP/DNS
+                            ;; specifically is dead — the known tun2socks
+                            ;; UDP-ASSOCIATE-session failure mode. Targeted,
+                            ;; cheap fix: restart just tun2socks, not the
+                            ;; whole route setup, since routes/gateway are
+                            ;; not what's broken here.
+                            (format t "~&[dog] gateway unchanged (~a), tunnel functional, but UDP/DNS dead after gap — restarting tun2socks~%"
+                                    cur-gateway)
+                            (ignore-errors (restart-tun2socks))
+                            (setf fail-count 0 ok-count 0 *sweep-tries* 0))
+                           (t
+                            (format t "~&[dog] gateway unchanged (~a), tunnel and DNS functional, skipping reconfigure~%"
+                                    cur-gateway)))))
                       (t
                        ;; Quiet tick: keep our notion of the current gateway fresh so
                        ;; the next gap (if any) has an accurate baseline to compare to.
-                       (setf last-gateway (or (current-gateway) last-gateway))
+                       (setf last-gateway (or (physical-gateway *watched-interface*) last-gateway))
                        (ecase *regime*
                          (:tunnel (setf fail-count (tick-tunnel fail-count)))
                          (:direct (setf ok-count (tick-direct ok-count))))))
