@@ -143,7 +143,7 @@ traffic doesn't.
 (load "dog.lisp")
 (connect)     ; sing-box → tun2socks → routes → watcher, all in one
 (watch?)      ; current mode, thread status, interface
-(disconnect)  ; stop watcher, wait for it, roll everything back
+(disconn)  ; stop watcher, wait for it, roll everything back
 ```
 
 Verify: `curl https://cloudflare.com/cdn-cgi/trace` should show the proxy's

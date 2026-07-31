@@ -1,6 +1,20 @@
 ;;; A single watcher serializes tunnel reconfiguration.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; Must run BEFORE singbox.lisp/tun.lisp load — those files defparameter
+  ;; *process*/*proxy-server-ip*/etc, which would silently drop the handle
+  ;; to a live tunnel out from under us. At this point in the reload,
+  ;; *thread*/disconn (if bound at all) are still the OLD ones from the
+  ;; previous load, seeing the still-live state — exactly what we need to
+  ;; tear it down cleanly instead of leaking it.
+  (when (and (boundp '*thread*) (symbol-value '*thread*)
+             (sb-thread:thread-alive-p (symbol-value '*thread*))
+             (fboundp 'disconn))
+    (format t "~&[dog] reloading while connected — running (disconn) on the old session first~%")
+    (handler-case (funcall (symbol-function 'disconn))
+      (error (e)
+        (format t "~&[dog] auto-disconn failed (~a) — check `ps aux | grep tun2socks`, ~
+                   `route -n get default`, and /var/run/lisp-vpn-* by hand before continuing~%" e))))
   (let ((here (or *load-truename* *load-pathname*
                   *compile-file-truename* *compile-file-pathname*
                   (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
@@ -284,7 +298,7 @@
       (start-full))
   (watch))
 
-(defun disconnect ()
+(defun disconn ()
   "Inverse of connect. unwatch only flips a flag — the watcher thread
    might be mid-iteration and could still be running its own stop-full/
    start-full right now. Join it first, so this thread's stop-full below
@@ -293,4 +307,3 @@
   (when (and *thread* (sb-thread:thread-alive-p *thread*))
     (sb-thread:join-thread *thread* :default nil))
   (stop-full))
-  
