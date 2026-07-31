@@ -145,33 +145,58 @@
   "True only if the TUN interface exists AND traffic sent through it
    actually reaches the internet. Unlike server-alive-p (which checks the
    proxy's own reachability over a route that bypasses the TUN), this is
-   the one check that can detect a dead/vanished utun interface or a
-   wedged tun2socks after sleep/wake, where the route table still points
-   at TUN_IP but nothing is actually forwarding through it.
+   the one check that can detect a dead/vanished utun interface, a wedged
+   tun2socks, or a dead sing-box-side connection to the remote proxy
+   after sleep/wake — any of which can break TCP, not just UDP.
 
-   NOTE: this only proves TCP works. A TCP CONNECT through SOCKS5 is
-   opened fresh every time, so this can't see a dead SOCKS5 UDP ASSOCIATE
-   session — see DNS-OVER-UDP-ALIVE-P for the check that can."
+   Gates the choice between the two recovery paths in CYCLE: if this is
+   false, TCP itself is down, and full-reconfigure (stop-full/start-full
+   + a full route rebuild) runs. If this is true but DNS-OVER-UDP-ALIVE-P
+   is false, RESTART-TUNNEL-STACK runs instead — cheaper, since it skips
+   re-capturing the gateway and re-adding the proxy host route, neither
+   of which is what's broken in that case.
+
+   NOTE: RESTART-TUNNEL-STACK now restarts sing-box as well as tun2socks
+   (see its docstring — restarting tun2socks alone once left DNS dead
+   even with this check passing), so the two recovery paths overlap more
+   than they used to; the remaining reason to keep this check separate
+   from DNS-OVER-UDP-ALIVE-P is purely the route/gateway cost, not which
+   processes get restarted. Once dropped that distinction entirely
+   (skipping straight to the cheap path always) and that left the
+   internet reliably dead after some real sleep/wake gaps — so keep this
+   gate until there's a concrete case showing it's provably redundant,
+   not just a theory that it should be."
   (and (ignore-errors (tun-interface-up-p *tun-name*))
        (ignore-errors (port-open-p *tunnel-check-host* *tunnel-check-port* :timeout 3))))
 
-(defun dns-over-udp-alive-p (&key (host *tunnel-check-host*) (timeout 2))
+(defun dns-over-udp-alive-p (&key (host *tunnel-check-host*) (timeout 2) (tries 2))
   "True if a real UDP DNS query to HOST:53 gets an answer within TIMEOUT
-   seconds. This is the check that can see the specific failure this
-   project has been chasing: SOCKS5's UDP ASSOCIATE session (which
-   tun2socks needs for anything UDP, including DNS) can die across a
-   sleep/wake gap while ordinary TCP CONNECT sessions — including the
-   one TUNNEL-FUNCTIONAL-P uses — keep working, since each TCP
-   connection opens fresh and shares none of that state. A tunnel that
-   passes TUNNEL-FUNCTIONAL-P but fails this is exactly 'processes and
-   interface look fine, TCP works, but there is no internet.'
+   seconds per attempt, retrying up to TRIES times. This is the check
+   that can see the specific failure this project has been chasing:
+   SOCKS5's UDP ASSOCIATE session (which tun2socks needs for anything
+   UDP, including DNS) can die across a sleep/wake gap while ordinary
+   TCP CONNECT sessions — including the one TUNNEL-FUNCTIONAL-P uses —
+   keep working, since each TCP connection opens fresh and shares none
+   of that state. A tunnel that passes TUNNEL-FUNCTIONAL-P but fails
+   this is exactly 'processes and interface look fine, TCP works, but
+   there is no internet.'
+
+   TRIES defaults to 2, not 1: right after a real wake, the very first
+   UDP packet through a still-settling path (ARP, the proxy's first
+   round-trip since sleep) can occasionally be genuinely slow rather
+   than actually dead, and a single 2s/no-retry attempt read that as
+   'DNS is dead' often enough to trigger an unwanted restart-tunnel-stack
+   (or worse, toggle-wifi) on sleeps that were actually fine — dig's own
+   +tries flag does this retry internally, so this is one run-program
+   call either way, not TRIES separate ones.
    Uses /usr/bin/dig, which ships with macOS. Queries cloudflare.com as
    a placeholder — the answer's content doesn't matter, only whether a
-   NOERROR reply comes back at all within TIMEOUT."
+   NOERROR reply comes back at all within the time budget."
   (let ((lines (run-program-lines "/usr/bin/dig"
                                   (list (format nil "@~a" host)
                                         (format nil "+time=~a" timeout)
-                                        "+tries=1" "cloudflare.com"))))
+                                        (format nil "+tries=~a" tries)
+                                        "cloudflare.com"))))
     (and lines (some (lambda (l) (search "status: NOERROR" l)) lines))))
 
 (defun switch-to-config (index)
@@ -194,7 +219,7 @@
 (defun run-program-lines (program args)
   "Runs PROGRAM with ARGS, returns its stdout as a list of lines, or nil
    if the run errors or produces nothing. Shared by IF-STATUS and
-   CURRENT-GATEWAY, both of which shell out and scrape a line of output."
+   PHYSICAL-GATEWAY, both of which shell out and scrape a line of output."
   (let ((output (ignore-errors
                  (with-output-to-string (s)
                    (sb-ext:run-program program args :output s :error nil :wait t)))))
@@ -237,22 +262,6 @@
    *sleep-gap-threshold* — grounds to suspect (not conclude) sleep/wake."
   (> (- now last-tick) *sleep-gap-threshold*))
 
-(defun current-gateway ()
-  "Returns the current default gateway IPv4 as a string, or nil if it
-   can't be determined (no default route, /sbin/route missing/erred, or
-   unparseable output).
-
-   NOT safe to use for sleep/wake gateway confirmation while *REGIME* is
-   :TUNNEL — SETUP-ROUTES has already pointed the kernel's default route
-   at TUN_IP by then, so this always reads back 198.18.0.1 regardless of
-   what the real upstream router is doing. It answers 'what is the
-   default route right now', which during a tunnel is a constant, not a
-   useful signal. See PHYSICAL-GATEWAY for the check that actually
-   reflects the network underneath the tunnel."
-  (let* ((lines (run-program-lines "/sbin/route" (list "-n" "get" "default")))
-         (gw (field-at (find-if (lambda (l) (search "gateway:" l)) lines) #\: 1)))
-    (when (and gw (plusp (length gw))) gw)))
-
 (defun physical-gateway (interface)
   "Returns INTERFACE's real upstream router IPv4 (from its DHCP lease),
    or nil if it can't be determined. Unlike CURRENT-GATEWAY, this reads
@@ -264,6 +273,56 @@
          (gw (and lines (string-trim '(#\Space #\Tab #\Return) (first lines)))))
     (when (and gw (plusp (length gw))) gw)))
 
+(defun toggle-wifi (&optional (interface *watched-interface*) (timeout 30))
+  "Power-cycles the Wi-Fi radio on INTERFACE via networksetup, then
+   BLOCKS until it's genuinely back (status active AND a real gateway
+   reachable via physical-gateway) or TIMEOUT seconds pass. This is the
+   fix for a documented macOS/Wi-Fi-driver issue where, after sleep, the
+   physical interface itself — below sing-box, tun2socks, and the TUN
+   entirely — silently stops carrying UDP while TCP keeps working.
+   Confirmed the hard way in this project: restarting sing-box and
+   tun2socks both, fresh processes and all, did not fix a case of this,
+   because the break sits underneath both of them, in the radio/driver
+   state, not in anything this codebase runs. Toggling the interface is
+   the only known lever at this layer.
+
+   The wait is not optional. A first version of this returned right
+   after issuing the 'on' command, on the theory that CYCLE's own
+   network-change detection would pick up the bounce on a later tick.
+   In practice, ifconfig can report status \"active\" before DHCP/
+   reassociation is actually done, so ticks landing in that window fall
+   through to ordinary tick-tunnel logic, which calls server-alive-p —
+   and with no real network yet, that fails for a reason that has
+   nothing to do with the proxy, indistinguishable (from tick-tunnel's
+   side) from 'this pool entry is dead'. Enough consecutive failures
+   there rotates through the whole pool and falls back to *regime*
+   :direct — confirmed happening in practice once. Blocking here, in
+   this single-threaded loop, means no tick can run against a
+   half-reassociated interface at all, closing that window rather than
+   racing it."
+  (ignore-errors
+    (sb-ext:run-program "/usr/sbin/networksetup"
+                        (list "-setairportpower" interface "off")
+                        :input nil :wait t))
+  (sleep 2)
+  (ignore-errors
+    (sb-ext:run-program "/usr/sbin/networksetup"
+                        (list "-setairportpower" interface "on")
+                        :input nil :wait t))
+  (handler-case
+      (progn
+        (wait-until (lambda ()
+                      (multiple-value-bind (status ip) (if-status)
+                        (declare (ignore ip))
+                        (and (string= status "active") (physical-gateway interface))))
+                    :timeout timeout
+                    :description (format nil "~a reassociation after Wi-Fi toggle" interface))
+        (format t "~&[dog] toggled ~a Wi-Fi radio off/on, reassociated~%" interface)
+        t)
+    (error (e)
+      (format t "~&[dog] toggled ~a Wi-Fi radio off/on, but it did not reassociate within ~as (~a)~%"
+              interface timeout e)
+      nil)))
 
 (defun full-reconfigure (reason)
   (format t "~&[dog] network change (~a), waiting ~as to settle~%" reason *settle-delay*)
@@ -279,13 +338,14 @@
   "Cheap, no-network liveness check for the local tunnel machinery itself:
    does the TUN interface still exist, and is tun2socks still running.
    Unlike server-alive-p (raw reachability to the proxy, which bypasses
-   the TUN and so can't see tun2socks/utun dying) or tunnel-functional-p
-   (a real network round-trip, reserved for the heavier post-sleep gap
-   check), this only shells out to ifconfig/pgrep — safe to run on every
-   single tick without adding constant background network traffic.
-   Exists because tun2socks/utun can die silently *between* ticks, not
-   just at a detected sleep/wake gap or interface change — server-alive-p
-   alone would never notice that."
+   the TUN and so can't see tun2socks/utun dying) or
+   tunnel-functional-p/dns-over-udp-alive-p (real network round-trips,
+   reserved for the post-sleep gap check), this only shells out to
+   ifconfig/pgrep — safe to run on every single tick without adding
+   constant background network traffic. Exists because tun2socks/utun can
+   die silently *between* ticks, not just at
+   a detected sleep/wake gap or interface change — server-alive-p alone
+   would never notice that."
   (and (ignore-errors (tun-interface-up-p *tun-name*))
        (ignore-errors
         (plusp (length (string-trim '(#\Newline #\Space #\Return)
@@ -403,11 +463,14 @@
                             (setf last-gateway cur-gateway)
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                            ((not (tunnel-functional-p))
-                            ;; Gateway address unchanged says nothing about
-                            ;; whether utun/tun2socks itself survived the gap —
-                            ;; only an end-to-end check through
-                            ;; tunnel-functional-p can catch that. Reconfigure
-                            ;; since the plumbing is dead.
+                            ;; TCP through the tunnel is down too, not just
+                            ;; UDP/DNS. full-reconfigure (stop-full/start-full +
+                            ;; full route rebuild) is still the response here —
+                            ;; not because restart-tunnel-stack couldn't fix a
+                            ;; dead sing-box connection (it can, see its
+                            ;; docstring), but because a gap this broken
+                            ;; warrants recapturing the gateway/routes too,
+                            ;; rather than assuming they're still fine.
                             (format t "~&[dog] gateway unchanged (~a) but tunnel not functional after gap, reconfiguring~%"
                                     cur-gateway)
                             (full-reconfigure "sleep/wake gap, tunnel not functional")
@@ -415,14 +478,46 @@
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                            ((not (dns-over-udp-alive-p))
                             ;; TCP through the tunnel is fine, but UDP/DNS
-                            ;; specifically is dead — the known tun2socks
-                            ;; UDP-ASSOCIATE-session failure mode. Targeted,
-                            ;; cheap fix: restart just tun2socks, not the
-                            ;; whole route setup, since routes/gateway are
-                            ;; not what's broken here.
-                            (format t "~&[dog] gateway unchanged (~a), tunnel functional, but UDP/DNS dead after gap — restarting tun2socks~%"
+                            ;; specifically is dead. First try the cheap fix:
+                            ;; restart-tunnel-stack (sing-box + tun2socks),
+                            ;; without touching routes/gateway.
+                            (format t "~&[dog] gateway unchanged (~a), tunnel functional, but UDP/DNS dead after gap — restarting tunnel stack~%"
                                     cur-gateway)
-                            (ignore-errors (restart-tun2socks))
+                            (ignore-errors (restart-tunnel-stack))
+                            (sleep 2)
+                            (unless (ignore-errors (dns-over-udp-alive-p))
+                              ;; Software restart alone didn't fix it — this
+                              ;; points below sing-box/tun2socks entirely, to
+                              ;; a documented macOS Wi-Fi driver quirk where
+                              ;; the radio silently stops carrying UDP after
+                              ;; sleep while TCP keeps working, and no amount
+                              ;; of restarting userspace processes touches
+                              ;; it. The only known fix is power-cycling the
+                              ;; Wi-Fi radio itself.
+                              (format t "~&[dog] still dead after tunnel stack restart — toggling Wi-Fi radio~%")
+                              (if (ignore-errors (toggle-wifi))
+                                  (progn
+                                    ;; toggle-wifi already blocked until real
+                                    ;; reassociation, so rebuild explicitly now
+                                    ;; rather than betting on the next tick's
+                                    ;; detect-network-change to notice — if
+                                    ;; DHCP happens to hand back the exact same
+                                    ;; IP, there's no IP-change for it to catch,
+                                    ;; and nothing would ever rebuild the
+                                    ;; tunnel. Resync last-if-status/last-if-ip
+                                    ;; to the post-toggle state too, so that
+                                    ;; tick doesn't also see a "change" and fire
+                                    ;; a second, redundant reconfigure.
+                                    (full-reconfigure "Wi-Fi toggle recovered from stuck UDP")
+                                    (multiple-value-bind (s i) (if-status)
+                                      (setf last-if-status s last-if-ip i))
+                                    (setf last-gateway (physical-gateway *watched-interface*)))
+                                  ;; toggle-wifi itself timed out waiting for
+                                  ;; reassociation — nothing this codebase runs
+                                  ;; can fix that; leave *regime* as-is and let
+                                  ;; the next gap/tick keep retrying rather than
+                                  ;; guessing further here.
+                                  (format t "~&[dog] Wi-Fi did not reassociate — leaving for next tick to retry~%")))
                             (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                            (t
                             (format t "~&[dog] gateway unchanged (~a), tunnel and DNS functional, skipping reconfigure~%"

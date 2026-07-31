@@ -65,25 +65,37 @@
    nothing re-points default at it until this runs."
   (privileged "reassert-default"))
 
-(defun restart-tun2socks ()
-  "Restarts just tun2socks (stop-tun + start-tun + assign-tun-ip +
-   reassert-default-route) without touching setup-routes/teardown-routes
-   or the captured gateway. This is the targeted fix for tun2socks's
-   SOCKS5 UDP ASSOCIATE session dying across a sleep/wake gap (breaking
-   UDP — in particular DNS — while ordinary TCP keeps working, since
-   each TCP connection opens fresh): the interface disappears and comes
-   back via stop-tun/start-tun, which is enough to reset that session,
-   without paying for a full teardown+rebuild of the gateway capture or
-   proxy host route, which were never actually broken.
+(defun restart-tunnel-stack ()
+  "Restarts sing-box and tun2socks (sing-box first, then tun2socks +
+   assign-tun-ip + reassert-default-route), without touching
+   setup-routes/teardown-routes or the captured gateway.
 
-   reassert-default-route is not optional here — without it the
+   Originally this (as RESTART-TUN2SOCKS) restarted only tun2socks, on
+   the theory that a dead SOCKS5 UDP ASSOCIATE session was purely local
+   to tun2socks's side of that association, so restarting sing-box too
+   would just be extra cost for no extra benefit. In practice that left
+   DNS/UDP dead even in cases where tunnel-functional-p (TCP) had passed
+   right before the restart — meaning the stale state can also live on
+   sing-box's side (its own connection/session to the remote proxy),
+   which restarting tun2socks alone can never touch, since sing-box
+   itself was never killed. Restarting sing-box first forces a fresh
+   end-to-end connection to the remote proxy; tun2socks then reconnects
+   to a clean SOCKS5 endpoint rather than a stale one.
+
+   Still far cheaper than full-reconfigure: no teardown-routes/
+   setup-routes round-trip, no gateway re-capture, no proxy host route
+   change — those were never what was broken here.
+
+   reassert-default-route is not optional — without it tun2socks's
    interface comes back but nothing sends traffic through it at all,
    since the kernel default route was dropped along with the old utun9."
+  (ignore-errors (stop))
+  (start)
   (ignore-errors (stop-tun))
   (start-tun)
   (assign-tun-ip)
   (reassert-default-route)
-  (format t "~&[dog] tun2socks restarted~%"))
+  (format t "~&[dog] tunnel stack restarted (sing-box + tun2socks)~%"))
 
 (defun start-full ()
   (start)
