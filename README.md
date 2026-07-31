@@ -1,13 +1,11 @@
 # raydog
 
 A minimal Common Lisp VPN client. Brings up a system-wide TUN tunnel over
-any sing-box outbound (Shadowsocks, VLESS, etc). No GUI, no v2box.
+any sing-box outbound (Shadowsocks, VLESS, etc).
 
 Controlled from the REPL, no system daemon. `(connect)` in `dog.lisp` starts
 the tunnel plus a background watcher thread that keeps it alive — checks
-proxy liveness and network changes on its own, calls `stop-full`/`start-full`
-as needed. For just the tunnel with no watcher, use `singbox.lisp` /
-`tun.lisp` directly (`start-full` / `stop-full`).
+proxy liveness and network changes on its own.
 
 ## Files
 
@@ -16,9 +14,9 @@ as needed. For just the tunnel with no watcher, use `singbox.lisp` /
 - **`tun.lisp`** — creates the TUN interface, redirects traffic, rolls
   back routes on stop. All privileged work goes through one root helper
   (below), never called directly.
-- **`config.lisp`** — parses `vless://`/`ss://` URIs and writes a matching
-  sing-box JSON config for each. No network or process code; pure parsing +
-  JSON generation.
+- **`config.lisp`** — parses `vless`/`vmess`/`ss`/`trojan`/`hysteria2`
+  URIs and writes a matching sing-box JSON config for each.
+  No network or process code; pure parsing + JSON generation.
 - **`dog.lisp`** — the only file you load. Pulls in the three files above
   and adds a watcher thread doing two jobs on every tick:
   1. **Proxy liveness** — TCP-checks the server; N failures in a row →
@@ -102,7 +100,7 @@ time rather than run concurrently.
 ## Config
 
 `*config-path*` in `singbox.lisp` points at a sing-box JSON config. You
-don't write these by hand — `dog.lisp` reads one `vless://`/`ss://` URI per
+don't write these by hand — `dog.lisp` reads one URI per
 line from `*server-list-path*` (default `/tmp/servers.txt`, `#` for
 comments) and `config.lisp` generates a matching config per line. `(connect)`
 starts on entry 0; on failure the watcher rotates through the rest.
@@ -146,16 +144,6 @@ traffic doesn't.
 (connect)     ; sing-box → tun2socks → routes → watcher, all in one
 (watch?)      ; current mode, thread status, interface
 (disconnect)  ; stop watcher, wait for it, roll everything back
-```
-
-Manual (no watcher/failover):
-
-```lisp
-(load "singbox.lisp")
-(load "tun.lisp")
-(start-full)
-(status)
-(stop-full)
 ```
 
 Verify: `curl https://cloudflare.com/cdn-cgi/trace` should show the proxy's
